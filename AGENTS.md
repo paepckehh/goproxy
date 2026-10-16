@@ -18,6 +18,7 @@ internal/stats       counters, event ring, traffic buckets, JSON snapshot
 internal/proxy       GOPROXY protocol handlers (singleflight, verify, cache)
 internal/ui          embedded dashboard (static/, vanilla JS, no external assets)
 internal/version     version injected via -ldflags
+systemd.nix          NixOS module: services.go-mod-proxy (persistent, hardened)
 ```
 
 Storage model: zips stored as-received (already deflate-compressed) under
@@ -29,6 +30,24 @@ FS is the persistent record; revisit only if event history outgrows the ring.
 Security: misses are verified against sum.golang.org (note signature + tlog
 tree + tiles) before caching; mismatch refuses content (502); no record serves
 unverified; checksum-db outage fails closed when `-verify=true`.
+
+## Deployment (NixOS)
+
+`systemd.nix` is a NixOS module fragment (same consumption pattern as
+../zdash/systemd.nix, host infra flake modules list) exposing
+`services.go-mod-proxy.{enable,bin,host,port,root}`. It deliberately runs a
+PERSISTENT server (`wantedBy = multi-user.target`, `Restart = always`,
+network-online ordering), NOT socket activation: fleet toolchains must find
+the proxy alive at any build time. Defaults: binary
+`/nix/persist/root/bin/goproxy` (make build, manual deploy), cache root
+`/nix/persist/cache/go/proxy`. Hardened: strict read-only FS plus
+ReadWritePaths on the cache root, seccomp `@system-service` minus
+{aio,keyring,memlock,setuid,timer}, zero capabilities (root kept only as
+stable cache owner identity), SocketBind pinned to the single port (outbound
+connect/DNS unaffected, no IP egress pinning since upstream fetch is the
+job), MemoryMax 512M / TasksMax 512 / LimitNOFILE 16384, full kernel/proc/
+keyring/namespace protection. The host side owns ingress (caddy vhost +
+listen IP, see ../nixos/server/all/go-mod-proxy01.nix).
 
 ## Required Go skills
 

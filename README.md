@@ -107,6 +107,38 @@ Layout: `cmd/goproxy` entrypoint; `internal/{store,sumdb,stats,proxy,ui,version}
 - `proxy` — GOPROXY protocol handlers
 - `ui` — embedded dashboard (vanilla JS, zero external assets)
 
+## NixOS / systemd deployment
+
+`systemd.nix` is a NixOS module fragment for the host infra flake (same
+pattern as the zdash module, but **persistent server mode, not
+socket-activated** — the fleet's `GOPROXY` must resolve at any build time,
+so the unit boots with the machine and stays resident):
+
+```nix
+# host module (see ../nixos/server/all/go-mod-proxy01.nix)
+services.go-mod-proxy = {
+  enable = true;
+  host = "127.0.0.1";          # behind the caddy reverse proxy
+  port = 7040;                 # infra.localhost.port.offset + app id
+};
+```
+
+- **binary** `/nix/persist/root/bin/goproxy` (default, override `bin`) —
+  `make build`, manual deploy
+- **cache** `/nix/persist/cache/go/proxy` (default, override `root`) —
+  survives reboots, standard `download/` layout
+- **hardening**: whole FS read-only except the cache root, seccomp
+  `@system-service` minus unneeded groups, zero capabilities (root only as a
+  stable cache-owner identity), bind syscalls pinned to the one listen port
+  (outbound `connect()`/DNS untouched), memory 512M cap, full
+  kernel/proc/namespace/keyring isolation; egress is unrestricted by design
+  — fetching from upstream is the job
+- **availability**: `Restart = always` with no start-rate-limit,
+  `network-online` ordering, bounded 15s stop matching the binary's 10s
+  graceful-shutdown window
+
+Ingress (caddy vhost, TLS, listen IP) is host-side configuration.
+
 ## License
 
 MIT.
