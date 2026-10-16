@@ -1,0 +1,4 @@
+/goproxy
+/cache/
+*.out
+*.test

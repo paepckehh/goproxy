@@ -1,0 +1,50 @@
+PROJECT=$(shell basename $(CURDIR))
+VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0-dev)
+LDFLAGS := -X paepcke.de/goproxy/internal/version.Version=$(VERSION)
+
+all: info
+
+info: 
+	echo "$(PROJECT) $(VERSION)"
+
+build:
+	touch $(PROJECT) && rm $(PROJECT)
+	go build -ldflags "$(LDFLAGS)" -o ./${PROJECT} ./cmd/$(PROJECT)
+
+update: 
+	git pull
+	git pull --tags 
+
+push: update
+	git push 
+	git push --tags
+
+deploy-test-nix: update build 
+	sudo -v
+	sudo mkdir -p /nix/persist/bin || true
+	sudo touch /nix/persist/root/bin/$(PROJECT)-pilot || true
+	sudo touch /nix/persist/root/bin/$(PROJECT)-pilot.old || true
+	sudo cp -af /nix/persist/root/bin/$(PROJECT)-pilot.old /nix/persist/root/bin/$(PROJECT)-pilot.old2 || true 
+	sudo cp -af /nix/persist/root/bin/$(PROJECT)-pilot /nix/persist/root/bin/$(PROJECT)-pilot.old || true 
+	sudo systemctl stop $(PROJECT)3.service || true
+	sudo mv -f ./chrony /nix/persist/root/bin/chrony-pilot || true
+	sudo systemctl start $(PROJECT)3.service
+
+deps:
+	rm -rf go.mod go.sum
+	go mod init paepcke.de/$(PROJECT)
+	go mod tidy -v
+	git config core.fileMode false
+check:
+	gofmt -l .
+	go vet ./...
+	go mod tidy -diff
+
+generate:
+	go generate ./...
+
+test:
+	CGO_ENABLED=1 go test -race -count=1 -parallel $$(nproc) -p $$(nproc) ./...
+
+cloc:
+	go run github.com/boyter/scc/v4@latest

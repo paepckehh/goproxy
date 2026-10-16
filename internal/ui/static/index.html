@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goproxy — operations dashboard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%236366f1'/%3E%3Cstop offset='1' stop-color='%2322d3ee'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='2' y='2' width='28' height='28' rx='7' fill='url(%23g)'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='16' font-weight='bold' text-anchor='middle' fill='%2305070f'%3EG%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="logo">G</div>
+    <div>
+      <h1>goproxy</h1>
+      <p>Go module proxy · cache · checksum verification</p>
+    </div>
+  </div>
+  <div class="status">
+    <span class="pill" id="version">v—</span>
+    <span class="pill" id="uptime">uptime —</span>
+    <span class="pill live"><i></i><span id="conn">live</span></span>
+  </div>
+</header>
+
+<main>
+  <section class="kpis">
+    <div class="card kpi" style="--i:0">
+      <span class="label">Requests</span>
+      <span class="value" id="kpi-requests">0</span>
+      <span class="sub" id="kpi-requests-sub">—</span>
+    </div>
+    <div class="card kpi" style="--i:1">
+      <span class="label">Cache hit ratio</span>
+      <span class="value ring-value">
+        <svg viewBox="0 0 36 36"><circle class="track" cx="18" cy="18" r="15.5"/><circle class="bar" id="ring" cx="18" cy="18" r="15.5"/></svg>
+        <span id="kpi-ratio">0%</span>
+      </span>
+      <span class="sub" id="kpi-ratio-sub">—</span>
+    </div>
+    <div class="card kpi accent" style="--i:2">
+      <span class="label">Bandwidth saved</span>
+      <span class="value green" id="kpi-saved">0 B</span>
+      <span class="sub" id="kpi-saved-sub">—</span>
+    </div>
+    <div class="card kpi" style="--i:3">
+      <span class="label">Served downstream</span>
+      <span class="value" id="kpi-down">0 B</span>
+      <span class="sub" id="kpi-down-sub">—</span>
+    </div>
+    <div class="card kpi" style="--i:4">
+      <span class="label">Fetched upstream</span>
+      <span class="value" id="kpi-up">0 B</span>
+      <span class="sub" id="kpi-up-sub">—</span>
+    </div>
+    <div class="card kpi" style="--i:5">
+      <span class="label">Cache store</span>
+      <span class="value" id="kpi-store">0 B</span>
+      <span class="sub" id="kpi-store-sub">—</span>
+    </div>
+  </section>
+
+  <section class="charts">
+    <div class="card chart">
+      <div class="card-head">
+        <h2>Top modules by served bandwidth</h2>
+        <span class="hint">3d · auto-rotating</span>
+      </div>
+      <canvas id="chart3d"></canvas>
+    </div>
+    <div class="card chart">
+      <div class="card-head">
+        <h2>Traffic</h2>
+        <span class="hint">hits · misses · last 2 min</span>
+      </div>
+      <canvas id="chart-traffic"></canvas>
+      <div class="legend">
+        <span><i class="dot cyan"></i>hits</span>
+        <span><i class="dot amber"></i>misses</span>
+        <span><i class="dot violet"></i>bytes/s</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="bottom">
+    <div class="card table-card">
+      <div class="card-head">
+        <h2>Cached modules</h2>
+        <span class="hint" id="modules-hint"></span>
+      </div>
+      <table>
+        <thead><tr>
+          <th>module</th><th class="r">versions</th><th class="r">size</th>
+          <th class="r">requests</th><th class="r">served</th><th>last used</th><th>trust</th>
+        </tr></thead>
+        <tbody id="modules-body"></tbody>
+      </table>
+      <div class="empty" id="modules-empty">cache is empty — run a build through the proxy</div>
+    </div>
+    <div class="card events-card">
+      <div class="card-head">
+        <h2>Latest events</h2>
+        <span class="hint" id="events-hint"></span>
+      </div>
+      <ul id="events"></ul>
+      <div class="empty" id="events-empty">no events yet</div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>point your toolchain at it:</span>
+  <code>export GOPROXY=http://localhost:5100 GOSUMDB=sum.golang.org</code>
+</footer>
+
+<script src="/static/app.js" defer></script>
+</body>
+</html>
