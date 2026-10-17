@@ -346,6 +346,60 @@ func TestHistory_ImportLegacyJSON(t *testing.T) {
 	}
 }
 
+// TestHistory_ImportLegacyJSONRetriesAfterFailure pins the atomicity: a
+// failed import must leave the database fresh (nothing partially written),
+// so the next start retries and imports the full legacy snapshot.
+func TestHistory_ImportLegacyJSONRetriesAfterFailure(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stats.db")
+	legacy := filepath.Join(dir, "stats.json")
+	snap := `{"totals":{"requests":9,"hits":8,"bytesSaved":900},
+		"events":[{"time":"2024-01-01T10:00:00Z","result":"hit","module":"m"}]}`
+	if err := os.WriteFile(legacy, []byte(snap), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ImportLegacyJSON(legacy); err == nil {
+		t.Fatal("import on a closed database should fail")
+	}
+
+	// The failed import left the database fresh: a retry imports fully.
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	imported, err := db.ImportLegacyJSON(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !imported {
+		t.Fatal("retry after a failed import did not import")
+	}
+	totals, err := db.LoadTotals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals.Requests != 9 || totals.Hits != 8 || totals.BytesSaved != 900 {
+		t.Errorf("imported totals = %+v", totals)
+	}
+	evs, err := db.RecentEvents(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 1 || evs[0].Module != "m" {
+		t.Errorf("imported events = %+v", evs)
+	}
+}
+
 // TestHistory_CollectorPersistsAcrossRestart is the end-to-end guarantee:
 // counters, history buckets and the event feed survive a restart through
 // the SQLite recorder.

@@ -145,7 +145,14 @@ func (d *DB) prune(now time.Time) {
 
 // SaveTotals upserts the lifetime counters (stats.Recorder).
 func (d *DB) SaveTotals(t stats.Totals) error {
-	_, err := d.db.Exec(`UPDATE totals SET
+	return saveTotalsTx(d.db, t)
+}
+
+// saveTotalsTx upserts the lifetime counters on an open transaction.
+func saveTotalsTx(tx interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}, t stats.Totals) error {
+	_, err := tx.Exec(`UPDATE totals SET
 			requests = ?, hits = ?, misses = ?, passes = ?,
 			verifications = ?, verify_failures = ?,
 			bytes_down = ?, bytes_up = ?, bytes_saved = ?
@@ -221,6 +228,17 @@ func (d *DB) AppendEvents(evs []stats.Event) error {
 		return fmt.Errorf("history: events: %w", err)
 	}
 	defer tx.Rollback()
+	if err := appendEventsTx(tx, evs); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("history: events: %w", err)
+	}
+	return nil
+}
+
+// appendEventsTx inserts a batch of events on an open transaction.
+func appendEventsTx(tx *sql.Tx, evs []stats.Event) error {
 	stmt, err := tx.Prepare(`INSERT INTO events (
 			time, result, module, version, kind, status, bytes, dur_ms, detail
 		) VALUES (?,?,?,?,?,?,?,?,?)`)
@@ -237,9 +255,6 @@ func (d *DB) AppendEvents(evs []stats.Event) error {
 			ev.Kind, ev.Status, ev.Bytes, ev.DurMS, ev.Detail); err != nil {
 			return fmt.Errorf("history: events: %w", err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("history: events: %w", err)
 	}
 	return nil
 }
@@ -415,11 +430,21 @@ func (d *DB) ImportLegacyJSON(path string) (bool, error) {
 	if t != (stats.Totals{}) || n > 0 {
 		return false, nil // not a fresh database
 	}
-	if err := d.SaveTotals(snap.Totals); err != nil {
+	// One transaction: a failed import leaves the database fresh, so the
+	// next start retries it instead of silently dropping the legacy data.
+	tx, err := d.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("history: legacy import: %w", err)
+	}
+	defer tx.Rollback()
+	if err := appendEventsTx(tx, snap.Events); err != nil {
 		return false, err
 	}
-	if err := d.AppendEvents(snap.Events); err != nil {
+	if err := saveTotalsTx(tx, snap.Totals); err != nil {
 		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("history: legacy import: %w", err)
 	}
 	if err := os.Rename(path, path+".imported"); err != nil {
 		return false, fmt.Errorf("history: legacy import: %w", err)

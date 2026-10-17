@@ -446,7 +446,7 @@ function drawHistory(payload) {
   for (let i = 0; i <= 3; i++) {
     const ms = t0 + (tSpan * i) / 3;
     ctx.textAlign = i === 0 ? "left" : i === 3 ? "right" : "center";
-    ctx.fillText(fmtHistoryTick(ms, state.historyRange), X(ms), h - 5);
+    ctx.fillText(fmtHistoryTick(ms, payload.range), X(ms), h - 5);
   }
 }
 
@@ -473,13 +473,19 @@ function renderHistorySummary(s) {
   $("history-summary").innerHTML = chips.join("");
 }
 
+// historySeq guards against stale responses: the 60s poll and range-click
+// fetches can resolve out of order, and only the newest request may render.
+let historySeq = 0;
+
 async function fetchHistory() {
+  const seq = ++historySeq;
   try {
     const resp = await fetch("/api/history?range=" + encodeURIComponent(state.historyRange), {
       cache: "no-store",
     });
     if (!resp.ok) throw new Error("status " + resp.status);
     const data = await resp.json();
+    if (seq !== historySeq) return; // superseded by a newer request
     drawHistory(data);
     renderHistorySummary(data.summary || {});
   } catch (err) {

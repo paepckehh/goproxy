@@ -144,13 +144,23 @@ func WithStoreSampler(f func() StoreStat) Option {
 }
 
 // WithTickInterval overrides the per-second traffic bucket interval.
+// Non-positive intervals keep the default (time.NewTicker panics on them).
 func WithTickInterval(d time.Duration) Option {
-	return func(s *Stats) { s.tickInterval = d }
+	return func(s *Stats) {
+		if d > 0 {
+			s.tickInterval = d
+		}
+	}
 }
 
-// WithFlushInterval overrides the recorder flush interval.
+// WithFlushInterval overrides the recorder flush interval. Non-positive
+// intervals keep the default (time.NewTicker panics on them).
 func WithFlushInterval(d time.Duration) Option {
-	return func(s *Stats) { s.flushInterval = d }
+	return func(s *Stats) {
+		if d > 0 {
+			s.flushInterval = d
+		}
+	}
 }
 
 // New creates a collector. rec persists lifetime totals, one history
