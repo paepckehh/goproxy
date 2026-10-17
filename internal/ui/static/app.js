@@ -1,6 +1,6 @@
 "use strict";
 
-const state = { version: "", stats: null, store: null, modules: [] };
+const state = { version: "", stats: null, store: null, modules: [], historyRange: "24h" };
 const counters = new Map(); // element id -> last numeric value
 
 const $ = (id) => document.getElementById(id);
@@ -352,6 +352,141 @@ function drawTraffic(traffic) {
   ctx.fillText("now", w - pad.r, h - 4);
 }
 
+// ---- Long-term history: minute buckets aggregated by the backend ----
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function fmtHistoryTick(ms, range) {
+  const d = new Date(ms);
+  if (range === "24h") {
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return hh + ":" + mm;
+  }
+  if (range === "7d" || range === "30d") return (d.getMonth() + 1) + "." + d.getDate() + ".";
+  if (range === "all") return MONTHS[d.getMonth()] + " '" + String(d.getFullYear()).slice(2);
+  return MONTHS[d.getMonth()];
+}
+
+function drawHistory(payload) {
+  const canvas = $("chart-history");
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const r = canvas.getBoundingClientRect();
+  if (canvas.width !== r.width * dpr) {
+    canvas.width = r.width * dpr;
+    canvas.height = r.height * dpr;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const w = r.width, h = r.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const pts = payload.points || [];
+  if (pts.length < 2) {
+    ctx.fillStyle = "#7c8aa5";
+    ctx.font = "13px ui-sans-serif, system-ui";
+    ctx.textAlign = "center";
+    ctx.fillText(
+      pts.length === 0
+        ? "no history yet — it accumulates every minute and survives reboots"
+        : "waiting for more data\u2026",
+      w / 2, h / 2
+    );
+    return;
+  }
+
+  const pad = { l: 8, r: 8, t: 16, b: 20 };
+  const iw = w - pad.l - pad.r;
+  const ih = h - pad.t - pad.b;
+  const t0 = new Date(pts[0].time).getTime();
+  const t1 = new Date(pts[pts.length - 1].time).getTime();
+  const tSpan = Math.max(1, t1 - t0);
+  const X = (ms) => pad.l + ((ms - t0) / tSpan) * iw;
+  const maxC = Math.max(1, ...pts.map((p) => p.hits + p.misses));
+  const Yc = (v) => pad.t + ih - (v / maxC) * ih;
+
+  // Stacked request areas: hits under hits+misses.
+  const area = (getV, color) => {
+    ctx.beginPath();
+    ctx.moveTo(X(t0), pad.t + ih);
+    pts.forEach((p) => ctx.lineTo(X(new Date(p.time).getTime()), Yc(getV(p))));
+    ctx.lineTo(X(t1), pad.t + ih);
+    ctx.closePath();
+    const grad = ctx.createLinearGradient(0, pad.t, 0, pad.t + ih);
+    grad.addColorStop(0, color.replace("%A", "0.35"));
+    grad.addColorStop(1, color.replace("%A", "0.02"));
+    ctx.fillStyle = grad;
+    ctx.fill();
+  };
+  area((p) => p.hits, "rgba(34, 211, 238, %A)");
+  area((p) => p.hits + p.misses, "rgba(251, 191, 36, %A)");
+
+  // Lines on their own scales: bandwidth saved, store size.
+  const line = (getV, color) => {
+    const maxV = Math.max(1, ...pts.map(getV));
+    ctx.beginPath();
+    pts.forEach((p, i) => {
+      const x = X(new Date(p.time).getTime());
+      const y = pad.t + ih - (getV(p) / maxV) * ih;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.6;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 8;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  };
+  line((p) => p.bytesSaved, "rgba(167, 139, 250, 0.95)");
+  line((p) => p.storeBytes, "rgba(52, 211, 153, 0.9)");
+
+  // Time ticks.
+  ctx.fillStyle = "#7c8aa5";
+  ctx.font = "10px ui-monospace, monospace";
+  ctx.textBaseline = "alphabetic";
+  for (let i = 0; i <= 3; i++) {
+    const ms = t0 + (tSpan * i) / 3;
+    ctx.textAlign = i === 0 ? "left" : i === 3 ? "right" : "center";
+    ctx.fillText(fmtHistoryTick(ms, state.historyRange), X(ms), h - 5);
+  }
+}
+
+function renderHistorySummary(s) {
+  const chips = [];
+  chips.push(`<span class="hstat"><b>${fmtNum(s.requests)}</b> requests</span>`);
+  const denom = (s.hits || 0) + (s.misses || 0);
+  if (denom > 0) {
+    chips.push(`<span class="hstat"><b>${Math.round((100 * s.hits) / denom)}%</b> hit ratio</span>`);
+  }
+  chips.push(`<span class="hstat green"><b>${fmtBytes(s.bytesSaved)}</b> saved</span>`);
+  chips.push(`<span class="hstat"><b>${fmtBytes(s.bytesDown)}</b> served</span>`);
+  chips.push(`<span class="hstat"><b>${fmtBytes(s.bytesUp)}</b> upstream</span>`);
+  if (s.verifyFailures > 0) {
+    chips.push(`<span class="hstat"><b>${fmtNum(s.verifyFailures)}</b> refusals</span>`);
+  }
+  if (s.storeStart > 0 && s.storeEnd > 0) {
+    const growth = s.storeEnd - s.storeStart;
+    const sign = growth >= 0 ? "+" : "-";
+    chips.push(
+      `<span class="hstat">cache <b>${fmtBytes(s.storeEnd)}</b> (${sign}${fmtBytes(Math.abs(growth))} in range)</span>`
+    );
+  }
+  $("history-summary").innerHTML = chips.join("");
+}
+
+async function fetchHistory() {
+  try {
+    const resp = await fetch("/api/history?range=" + encodeURIComponent(state.historyRange), {
+      cache: "no-store",
+    });
+    if (!resp.ok) throw new Error("status " + resp.status);
+    const data = await resp.json();
+    drawHistory(data);
+    renderHistorySummary(data.summary || {});
+  } catch (err) {
+    // keep the last rendered chart; the next poll retries
+  }
+}
+
 async function poll() {
   try {
     const resp = await fetch("/api/dashboard", { cache: "no-store" });
@@ -386,5 +521,15 @@ function setConn(ok) {
 }
 
 chart3d.init();
+document.querySelectorAll("#ranges button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#ranges button").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    state.historyRange = btn.dataset.range;
+    fetchHistory();
+  });
+});
 poll();
+fetchHistory();
 setInterval(poll, 2000);
+setInterval(fetchHistory, 60000);

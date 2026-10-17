@@ -2,7 +2,8 @@ package stats
 
 import (
 	"context"
-	"path/filepath"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -10,8 +11,6 @@ import (
 // run collects until stop, with fast intervals for tests.
 func run(t *testing.T, s *Stats) (stop func()) {
 	t.Helper()
-	s.tickInterval = 5 * time.Millisecond
-	s.saveInterval = 10 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -22,6 +21,10 @@ func run(t *testing.T, s *Stats) (stop func()) {
 		cancel()
 		<-done
 	}
+}
+
+func fastCollector(rec Recorder) *Stats {
+	return New(rec, WithTickInterval(5*time.Millisecond), WithFlushInterval(10*time.Millisecond))
 }
 
 func waitFor(t *testing.T, cond func() bool) {
@@ -37,7 +40,7 @@ func waitFor(t *testing.T, cond func() bool) {
 
 func TestStats_CountersAndEvents(t *testing.T) {
 	t.Parallel()
-	s := New("")
+	s := fastCollector(nil)
 	stop := run(t, s)
 	defer stop()
 
@@ -68,7 +71,7 @@ func TestStats_CountersAndEvents(t *testing.T) {
 
 func TestStats_TrafficBuckets(t *testing.T) {
 	t.Parallel()
-	s := New("")
+	s := fastCollector(nil)
 	stop := run(t, s)
 	defer stop()
 
@@ -97,41 +100,138 @@ func TestStats_TrafficBuckets(t *testing.T) {
 	}
 }
 
-func TestStats_PersistenceRoundtrip(t *testing.T) {
-	t.Parallel()
-	path := filepath.Join(t.TempDir(), "stats.json")
+// fakeRecorder captures recorder calls for inspection.
+type fakeRecorder struct {
+	mu      sync.Mutex
+	buckets []Bucket
+	totals  []Totals
+	events  []Event
+	fail    bool
+}
 
-	s := New(path)
-	stop := run(t, s)
+func (f *fakeRecorder) snapshot() (buckets []Bucket, totals []Totals, events []Event) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.buckets, f.totals, f.events
+}
+
+func (f *fakeRecorder) SaveTotals(t Totals) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return errors.New("boom")
+	}
+	f.totals = append(f.totals, t)
+	return nil
+}
+
+func (f *fakeRecorder) RecordBucket(b Bucket) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return errors.New("boom")
+	}
+	f.buckets = append(f.buckets, b)
+	return nil
+}
+
+func (f *fakeRecorder) AppendEvents(evs []Event) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return errors.New("boom")
+	}
+	f.events = append(f.events, evs...)
+	return nil
+}
+
+func TestStats_RecorderFlush(t *testing.T) {
+	t.Parallel()
+	rec := &fakeRecorder{}
+	s := fastCollector(rec)
+	stop := run(t, s) // Run baselines bucket deltas at the current counters
+	// Wait for the baseline and one flush cycle before recording activity.
+	waitFor(t, func() bool {
+		_, totals, _ := rec.snapshot()
+		return len(totals) >= 1
+	})
 	s.Hit("example.com/m", "v1.0.0", "zip", 100, time.Millisecond)
 	s.Miss("example.com/m", "v1.1.0", "zip", 500, 500, time.Millisecond, true)
-	waitFor(t, func() bool { return len(s.Snapshot().Events) >= 2 })
+	waitFor(t, func() bool {
+		_, _, events := rec.snapshot()
+		return len(events) >= 2
+	})
+	stop() // triggers the final flush
+
+	buckets, totals, events := rec.snapshot()
+	var hits, bytes int64
+	for _, b := range buckets {
+		hits += b.Hits
+		bytes += b.BytesSaved
+	}
+	if hits != 1 || bytes != 100 {
+		t.Errorf("flushed buckets: hits = %d, bytesSaved = %d, want 1, 100", hits, bytes)
+	}
+	if n := len(totals); n == 0 {
+		t.Error("no totals flushed")
+	} else {
+		last := totals[n-1]
+		if last.Hits != 1 || last.BytesSaved != 100 {
+			t.Errorf("last flushed totals = %+v", last)
+		}
+	}
+	if len(events) != 2 {
+		t.Errorf("flushed events = %d, want 2", len(events))
+	}
+}
+
+func TestStats_RecorderErrorsCountedNotFatal(t *testing.T) {
+	t.Parallel()
+	rec := &fakeRecorder{fail: true}
+	s := fastCollector(rec)
+	s.Hit("m", "v1.0.0", "zip", 10, time.Millisecond)
+	stop := run(t, s)
+	waitFor(t, func() bool { return s.Snapshot().PersistErrors > 0 })
 	stop()
-	if err := s.Save(); err != nil {
-		t.Fatal(err)
-	}
 
-	fresh := New(path)
-	if err := fresh.Load(); err != nil {
-		t.Fatal(err)
+	snap := s.Snapshot()
+	if snap.Lifetime.Hits != 1 {
+		t.Errorf("hits = %d, want 1 (recorder errors must not affect counting)", snap.Lifetime.Hits)
 	}
-	snap := fresh.Snapshot()
-	if snap.Lifetime.Hits != 1 || snap.Lifetime.BytesSaved != 100 {
-		t.Errorf("restored lifetime = %+v", snap.Lifetime)
-	}
-	if len(snap.Events) != 2 {
-		t.Errorf("restored events = %d, want 2", len(snap.Events))
-	}
+}
 
-	// Session counters start at zero after restart.
-	if snap.Session != (Totals{}) {
-		t.Errorf("session after restart = %+v, want zero", snap.Session)
+func TestStats_SeedContinuesLifetimeAndFeed(t *testing.T) {
+	t.Parallel()
+	s := New(nil)
+	old := Totals{Requests: 42, Hits: 40, BytesSaved: 4000}
+	events := []Event{
+		{Time: time.Now().Add(-2 * time.Minute).UTC(), Result: "hit", Module: "m"},
+		{Time: time.Now().Add(-1 * time.Minute).UTC(), Result: "miss", Module: "m"},
+	}
+	s.Seed(old, events) // newest first
+
+	stop := run(t, s)
+	defer stop()
+	waitFor(t, func() bool { return len(s.Snapshot().Events) >= 2 })
+
+	s.Hit("m", "v1.0.0", "zip", 10, time.Millisecond)
+	waitFor(t, func() bool { return len(s.Snapshot().Events) >= 3 })
+
+	snap := s.Snapshot()
+	if snap.Lifetime.Hits != 41 || snap.Lifetime.Requests != 43 {
+		t.Errorf("lifetime = %+v, want hits 41 requests 43", snap.Lifetime)
+	}
+	if snap.Session != (Totals{Requests: 1, Hits: 1, BytesDown: 10, BytesSaved: 10}) {
+		t.Errorf("session = %+v, want only the new hit", snap.Session)
+	}
+	if snap.Events[0].Result != "hit" {
+		t.Errorf("newest event = %q, want hit", snap.Events[0].Result)
 	}
 }
 
 func TestStats_EventDropNeverBlocks(t *testing.T) {
 	t.Parallel()
-	s := New("") // Run never started: channel fills up.
+	s := New(nil) // Run never started: channel fills up.
 
 	done := make(chan struct{})
 	go func() {
@@ -151,16 +251,5 @@ func TestStats_EventDropNeverBlocks(t *testing.T) {
 	}
 	if s.hits.Load() != eventChanSize*2 {
 		t.Errorf("hits = %d, want %d", s.hits.Load(), eventChanSize*2)
-	}
-}
-
-func TestStats_LoadMissingFile(t *testing.T) {
-	t.Parallel()
-	s := New(filepath.Join(t.TempDir(), "absent.json"))
-	if err := s.Load(); err != nil {
-		t.Fatal(err)
-	}
-	if s.Snapshot().Lifetime != (Totals{}) {
-		t.Error("loaded totals from missing file")
 	}
 }

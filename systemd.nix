@@ -5,6 +5,9 @@
 # a build starts (cold builds, CI jobs, laptops at odd hours), so the unit
 # boots with the machine and stays resident. Idle cost is the in-memory
 # index plus the stats ring, a few MB, a cheap price for instant cache hits.
+# The long-term stats SQLite database (<root>/stats.db, WAL) rides the same
+# persistent root: lifetime counters, minute-resolution history and the
+# event log all survive reboots with the service.
 #
 # Consumption (host side, see ../nixos/server/all/go-mod-proxy01.nix):
 #   services.go-mod-proxy = {
@@ -43,7 +46,7 @@ in {
     root = lib.mkOption {
       type = lib.types.path;
       default = /nix/persist/cache/go/proxy;
-      description = "persistent cache root: download/ layout, sumdb state, stats.json";
+      description = "persistent cache root: download/ layout, sumdb state, stats.db (SQLite, long-term stats)";
     };
   };
 
@@ -71,8 +74,8 @@ in {
         Restart = "always";
         RestartSec = "2s";
         # The binary bounds its own graceful shutdown to 10s (SIGTERM stops
-        # the listener, drains, flushes the stats snapshot), no need to wait
-        # out the default 90s.
+        # the listener, drains, flushes the stats SQLite WAL checkpoint), no
+        # need to wait out the default 90s.
         TimeoutStopSec = "15s";
         # Cache stays private to the service owner.
         UMask = "0077";

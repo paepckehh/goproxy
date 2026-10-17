@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"paepcke.de/goproxy/internal/history"
 	"paepcke.de/goproxy/internal/proxy"
 	"paepcke.de/goproxy/internal/stats"
 	"paepcke.de/goproxy/internal/store"
@@ -48,16 +49,44 @@ func main() {
 		log.Error("startup", "err", err)
 		os.Exit(1)
 	}
-	m := stats.New(filepath.Join(st.Root(), "stats.json"))
-	if err := m.Load(); err != nil {
-		log.Warn("loading stats snapshot", "err", err)
+
+	// Long-term stats: cgo-free SQLite, everything survives reboots.
+	hist, err := history.Open(filepath.Join(st.Root(), "stats.db"))
+	if err != nil {
+		log.Error("startup", "err", err)
+		os.Exit(1)
 	}
+	if imported, err := hist.ImportLegacyJSON(filepath.Join(st.Root(), "stats.json")); err != nil {
+		log.Warn("importing legacy stats snapshot", "err", err)
+	} else if imported {
+		log.Info("migrated stats.json into stats.db", "file", filepath.Join(st.Root(), "stats.json.imported"))
+	}
+	totals, err := hist.LoadTotals()
+	if err != nil {
+		log.Error("loading stats", "err", err)
+		os.Exit(1)
+	}
+	feed, err := hist.RecentEvents(512)
+	if err != nil {
+		log.Error("loading stats", "err", err)
+		os.Exit(1)
+	}
+	m := stats.New(hist, stats.WithStoreSampler(func() stats.StoreStat {
+		su := st.Summary()
+		return stats.StoreStat{
+			Bytes:    su.Size,
+			Modules:  int64(su.Modules),
+			Versions: int64(su.Versions),
+			Files:    int64(su.Files),
+		}
+	}))
+	m.Seed(totals, feed)
 	p, err := proxy.New(st, db, m, *upstream, *verify, moduleClient(), log)
 	if err != nil {
 		log.Error("startup", "err", err)
 		os.Exit(1)
 	}
-	uiH := ui.New(m, st, ver)
+	uiH := ui.New(m, st, hist, ver)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -72,7 +101,16 @@ func main() {
 		m.Indexed(n)
 		log.Info("cache index rebuilt", "modules", n, "took", time.Since(start).Round(time.Millisecond))
 	}()
-	go m.Run(ctx)
+	histDone := make(chan struct{})
+	go func() {
+		hist.Run(ctx) // daily event-log pruning + WAL hygiene
+		close(histDone)
+	}()
+	statsDone := make(chan struct{})
+	go func() {
+		m.Run(ctx)
+		close(statsDone)
+	}()
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -104,8 +142,12 @@ func main() {
 		log.Error("shutdown", "err", err)
 	}
 	stop()
-	if err := m.Save(); err != nil {
-		log.Error("saving stats", "err", err)
+	// Wait for the collector to flush its final bucket, then close the
+	// stats database cleanly.
+	<-statsDone
+	<-histDone
+	if err := hist.Close(); err != nil {
+		log.Error("closing stats database", "err", err)
 	}
 	log.Info("stopped")
 }
@@ -118,6 +160,7 @@ func dispatch(p *proxy.Proxy, uiH *ui.Handler, ver string) http.Handler {
 		path := r.URL.Path
 		switch {
 		case path == "/" || path == "/index.html" || path == "/api/dashboard" ||
+			path == "/api/history" ||
 			strings.HasPrefix(path, "/static/") || path == "/favicon.ico":
 			uiH.ServeHTTP(w, r)
 		case path == "/healthz":

@@ -1,17 +1,13 @@
 // Package stats tracks proxy operation: lifetime counters, a recent event
-// ring, per-second traffic buckets, and persistence across restarts via an
-// atomic JSON snapshot. The hot path only touches atomics and a buffered
-// channel, so recording never blocks a request.
+// ring, per-second traffic buckets, and long-term persistence through a
+// Recorder (the cgo-free SQLite backend in internal/history). The hot path
+// only touches atomics and a buffered channel, so recording never blocks a
+// request; the collector goroutine flushes to the recorder in batches.
 package stats
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io/fs"
-	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,8 +17,8 @@ const (
 	eventRingSize   = 512
 	trafficRingSize = 120 // two minutes of one-second buckets
 	eventChanSize   = 1024
-	saveInterval    = 30 * time.Second
-	tickInterval    = time.Second
+	defaultTick     = time.Second
+	defaultFlush    = 30 * time.Second
 )
 
 // Event is one operational event for the dashboard feed.
@@ -59,6 +55,38 @@ type Totals struct {
 	VerifyFailures int64 `json:"verifyFailures"`
 }
 
+// StoreStat is a point-in-time snapshot of the cache store size, sampled
+// alongside each history bucket.
+type StoreStat struct {
+	Bytes    int64 `json:"bytes"`
+	Modules  int64 `json:"modules"`
+	Versions int64 `json:"versions"`
+	Files    int64 `json:"files"`
+}
+
+// Bucket is the delta of the lifetime counters over one wall-clock minute
+// plus the store size at the end of the interval. Buckets are the long-term
+// history: one row per minute, aggregated by the dashboard into hourly and
+// daily series.
+type Bucket struct {
+	Bucket time.Time `json:"bucket"`
+	Totals
+	Store StoreStat `json:"store"`
+}
+
+// Recorder persists stats data outside the request path. Implementations
+// must be safe for concurrent use. Errors are counted and surfaced on the
+// dashboard (persistErrors); a failing recorder never degrades proxying.
+type Recorder interface {
+	// SaveTotals upserts the lifetime counters.
+	SaveTotals(Totals) error
+	// RecordBucket upserts one minute of activity: deltas merge, store
+	// snapshots overwrite.
+	RecordBucket(Bucket) error
+	// AppendEvents appends a batch of events atomically.
+	AppendEvents([]Event) error
+}
+
 // Snapshot is the dashboard-facing state.
 type Snapshot struct {
 	StartedAt     time.Time `json:"startedAt"`
@@ -68,14 +96,16 @@ type Snapshot struct {
 	Traffic       []Traffic `json:"traffic"`
 	Events        []Event   `json:"events"`
 	DroppedEvents int64     `json:"droppedEvents"`
+	PersistErrors int64     `json:"persistErrors"`
 	Started       bool      `json:"started"`
 }
 
 // Stats collects proxy metrics. Counters are lock-free; events flow through
-// a channel to a background collector started by Run.
+// a channel to a background collector started by Run, which also flushes
+// the recorder.
 type Stats struct {
 	started time.Time
-	path    string
+	rec     Recorder
 
 	requests      atomic.Int64
 	hits          atomic.Int64
@@ -87,77 +117,98 @@ type Stats struct {
 	verifications atomic.Int64
 	verifyFailed  atomic.Int64
 	dropped       atomic.Int64
+	dbErrs        atomic.Int64
 
-	evCh    chan Event
-	evMu    sync.Mutex
-	events  []Event
-	tMu     sync.Mutex
-	traffic []Traffic
+	evCh      chan Event
+	evMu      sync.Mutex
+	events    []Event
+	pending   []Event // events awaiting the next recorder flush; Run goroutine only
+	tMu       sync.Mutex
+	traffic   []Traffic
+	flushMu   sync.Mutex
+	lastFlush Totals // baseline for bucket deltas
 
-	loaded Totals // totals restored from the snapshot at startup
+	loaded       Totals // totals restored from the recorder at startup
+	storeSampler func() StoreStat
 
-	tickInterval time.Duration
-	saveInterval time.Duration
+	tickInterval  time.Duration
+	flushInterval time.Duration
 }
 
-// New creates a collector. If path is non-empty, totals and events persist
-// there as a JSON snapshot; call Load before Run to restore them.
-func New(path string) *Stats {
-	return &Stats{
-		started:      time.Now().UTC(),
-		path:         path,
-		evCh:         make(chan Event, eventChanSize),
-		tickInterval: tickInterval,
-		saveInterval: saveInterval,
-	}
+// Option configures a Stats collector.
+type Option func(*Stats)
+
+// WithStoreSampler samples the cache store size with each history bucket.
+func WithStoreSampler(f func() StoreStat) Option {
+	return func(s *Stats) { s.storeSampler = f }
 }
 
-// Load restores lifetime totals and recent events from the snapshot.
-func (s *Stats) Load() error {
-	if s.path == "" {
-		return nil
+// WithTickInterval overrides the per-second traffic bucket interval.
+func WithTickInterval(d time.Duration) Option {
+	return func(s *Stats) { s.tickInterval = d }
+}
+
+// WithFlushInterval overrides the recorder flush interval.
+func WithFlushInterval(d time.Duration) Option {
+	return func(s *Stats) { s.flushInterval = d }
+}
+
+// New creates a collector. rec persists lifetime totals, one history
+// bucket per minute and the event log; nil disables persistence (counters
+// and the feed stay in memory only).
+func New(rec Recorder, opts ...Option) *Stats {
+	s := &Stats{
+		started:       time.Now().UTC(),
+		rec:           rec,
+		evCh:          make(chan Event, eventChanSize),
+		tickInterval:  defaultTick,
+		flushInterval: defaultFlush,
 	}
-	data, err := os.ReadFile(s.path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
+	for _, opt := range opts {
+		opt(s)
 	}
-	if err != nil {
-		return fmt.Errorf("stats: %w", err)
-	}
-	var snap struct {
-		Totals Totals
-		Events []Event
-	}
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return fmt.Errorf("stats: snapshot: %w", err)
-	}
-	s.loaded = snap.Totals
-	s.requests.Add(snap.Totals.Requests)
-	s.hits.Add(snap.Totals.Hits)
-	s.misses.Add(snap.Totals.Misses)
-	s.passes.Add(snap.Totals.Passes)
-	s.bytesDown.Add(snap.Totals.BytesDown)
-	s.bytesUp.Add(snap.Totals.BytesUp)
-	s.bytesSaved.Add(snap.Totals.BytesSaved)
-	s.verifications.Add(snap.Totals.Verifications)
-	s.verifyFailed.Add(snap.Totals.VerifyFailures)
+	return s
+}
+
+// Seed restores lifetime totals and the event feed from the recorder,
+// continuing lifetime counters and history across restarts. newestFirst
+// must be newest-first, as returned by history.DB.RecentEvents.
+func (s *Stats) Seed(t Totals, newestFirst []Event) {
+	s.loaded = t
+	s.requests.Add(t.Requests)
+	s.hits.Add(t.Hits)
+	s.misses.Add(t.Misses)
+	s.passes.Add(t.Passes)
+	s.bytesDown.Add(t.BytesDown)
+	s.bytesUp.Add(t.BytesUp)
+	s.bytesSaved.Add(t.BytesSaved)
+	s.verifications.Add(t.Verifications)
+	s.verifyFailed.Add(t.VerifyFailures)
 	s.evMu.Lock()
-	s.events = append(s.events, snap.Events...)
+	for i := len(newestFirst) - 1; i >= 0; i-- {
+		s.events = append(s.events, newestFirst[i])
+	}
+	if len(s.events) > eventRingSize {
+		s.events = s.events[len(s.events)-eventRingSize:]
+	}
 	s.evMu.Unlock()
-	return nil
 }
 
-// Run consumes events and maintains traffic buckets until ctx is done,
-// then flushes and persists the final snapshot. Run blocks.
+// Run consumes events, maintains traffic buckets and flushes the recorder
+// until ctx is done, then flushes one final time. Run blocks.
 func (s *Stats) Run(ctx context.Context) {
 	tick := time.NewTicker(s.tickInterval)
-	save := time.NewTicker(s.saveInterval)
+	flush := time.NewTicker(s.flushInterval)
 	defer tick.Stop()
-	defer save.Stop()
+	defer flush.Stop()
 
-	// Baseline the tick diffs at the already-loaded lifetime counters,
-	// so a restart does not emit one giant synthetic bucket.
+	// Baseline the tick diffs and bucket deltas at the already-restored
+	// lifetime counters, so a restart does not emit one giant synthetic
+	// bucket.
 	lastHits, lastMisses, lastBytes := s.hits.Load(), s.misses.Load(), s.bytesDown.Load()
+	s.flushMu.Lock()
+	s.lastFlush = s.totals()
+	s.flushMu.Unlock()
 	for {
 		select {
 		case ev := <-s.evCh:
@@ -176,15 +227,15 @@ func (s *Stats) Run(ctx context.Context) {
 			}
 			s.tMu.Unlock()
 			lastHits, lastMisses, lastBytes = h, m, b
-		case <-save.C:
-			s.Save()
+		case <-flush.C:
+			s.flush()
 		case <-ctx.Done():
 			for {
 				select {
 				case ev := <-s.evCh:
 					s.append(ev)
 				default:
-					s.Save()
+					s.flush()
 					return
 				}
 			}
@@ -199,6 +250,45 @@ func (s *Stats) append(ev Event) {
 		s.events = s.events[len(s.events)-eventRingSize:]
 	}
 	s.evMu.Unlock()
+	if s.rec != nil {
+		s.pending = append(s.pending, ev)
+	}
+}
+
+// flush persists the bucket delta since the last flush, the lifetime
+// totals and the pending events. Only the Run goroutine calls it, so the
+// pending slice needs no lock. On recorder errors the delta baseline and
+// the pending batch are kept, so failed writes are retried next flush.
+func (s *Stats) flush() {
+	if s.rec == nil {
+		return
+	}
+	t := s.totals()
+	s.flushMu.Lock()
+	delta := subtract(t, s.lastFlush)
+	s.flushMu.Unlock()
+	var st StoreStat
+	if s.storeSampler != nil {
+		st = s.storeSampler()
+	}
+	if err := s.rec.RecordBucket(Bucket{Bucket: time.Now().UTC(), Totals: delta, Store: st}); err != nil {
+		s.dbErrs.Add(1)
+	} else {
+		s.flushMu.Lock()
+		s.lastFlush = t
+		s.flushMu.Unlock()
+	}
+	if err := s.rec.SaveTotals(t); err != nil {
+		s.dbErrs.Add(1)
+	}
+	if len(s.pending) == 0 {
+		return
+	}
+	if err := s.rec.AppendEvents(s.pending); err != nil {
+		s.dbErrs.Add(1)
+	} else {
+		s.pending = s.pending[:0]
+	}
 }
 
 // Hit records a cache hit serving the given byte count.
@@ -327,6 +417,7 @@ func (s *Stats) Snapshot() Snapshot {
 		Traffic:       traffic,
 		Events:        events,
 		DroppedEvents: s.dropped.Load(),
+		PersistErrors: s.dbErrs.Load(),
 		Started:       true,
 	}
 }
@@ -357,41 +448,4 @@ func subtract(a, b Totals) Totals {
 		Verifications:  a.Verifications - b.Verifications,
 		VerifyFailures: a.VerifyFailures - b.VerifyFailures,
 	}
-}
-
-// Save persists the snapshot atomically.
-func (s *Stats) Save() error {
-	if s.path == "" {
-		return nil
-	}
-	s.evMu.Lock()
-	events := make([]Event, len(s.events))
-	copy(events, s.events)
-	s.evMu.Unlock()
-	data, err := json.MarshalIndent(struct {
-		Totals Totals  `json:"totals"`
-		Events []Event `json:"events"`
-	}{Totals: s.totals(), Events: events}, "", "  ")
-	if err != nil {
-		return fmt.Errorf("stats: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return fmt.Errorf("stats: %w", err)
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".stats-*")
-	if err != nil {
-		return fmt.Errorf("stats: %w", err)
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("stats: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("stats: %w", err)
-	}
-	if err := os.Rename(tmp.Name(), s.path); err != nil {
-		return fmt.Errorf("stats: %w", err)
-	}
-	return nil
 }

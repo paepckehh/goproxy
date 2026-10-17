@@ -11,7 +11,8 @@ A modern, fast, caching Go module proxy in a single cgo-free binary.
   on disk next to the module; tampered content is refused
 - **cool** — an embedded, dependency-free 3D animated operations dashboard:
   hit ratio, bandwidth saved, upstream/downstream traffic, store usage,
-  top modules, and a live event feed
+  top modules, a live event feed, and a long-term history section (24h to
+  all-time) backed by minute-resolution stats kept in SQLite
 
 ## Quick start
 
@@ -42,6 +43,7 @@ Then visit <http://localhost:5100/> in a browser.
 | `GET /sumdb/<db>/...`          | transparently forwarded, lets clients verify fully    |
 | `GET /`                        | operations dashboard                                  |
 | `GET /api/dashboard`           | JSON: stats, store, modules, events (polled every 2s) |
+| `GET /api/history?range=...`  | JSON: long-term stats series (`24h`/`7d`/`30d`/`1y`/`all`) |
 | `GET /healthz`                 | liveness + version                                   |
 
 ## Configuration
@@ -61,7 +63,7 @@ Then visit <http://localhost:5100/> in a browser.
 <root>/download/<escaped module>/@v/<version>.info|.mod|.zip
 <root>/download/<escaped module>/@v/<version>.sum    signed checksum record
 <root>/sumdb/                                        verification state + tiles
-<root>/stats.json                                    lifetime stats + event ring
+<root>/stats.db                                      long-term stats (SQLite, WAL)
 ```
 
 - Module zips are stored exactly as received — already deflate-compressed,
@@ -71,12 +73,28 @@ Then visit <http://localhost:5100/> in a browser.
 - The index lives entirely in memory and is rebuilt by a parallel directory
   walk at startup (~ms per 1000 files). Requests also fall back to a stat
   while the scan is still running, so there is no startup gap.
-- Lifetime counters and the recent event ring persist as an atomic JSON
-  snapshot, so savings and history survive restarts.
 
-No SQLite by design: the file system is the persistent record, the index is
-derived state, and the snapshot covers the rest — the single binary stays
-cgo-free and dependency-light (only `golang.org/x/mod` and `golang.org/x/sync`).
+## Long-term stats persistence
+
+Everything the dashboard shows survives reboots. `stats.db` is a SQLite
+database written by the pure-Go, cgo-free driver (`modernc.org/sqlite`,
+WAL journaling), so the single binary stays cgo-free. It holds:
+
+- **lifetime totals** — restored at startup, continued, never reset
+- **one bucket per minute** of requests, hits, misses, bytes up/down/saved,
+  verifications and cache-store size snapshots; kept forever (~half a
+  million rows per year), aggregated by the dashboard into 24h/7d/30d/1y
+  and all-time series
+- **the event log** — recent events for the dashboard feed, pruned after
+  90 days (buckets and totals are kept forever)
+
+The hot path never touches the database: counters are atomics, events
+  flow through a buffered channel, and a collector goroutine flushes
+  batches every 30 seconds plus once on shutdown (WAL checkpoint included).
+  Recorder errors are counted and surfaced as `persistErrors` on the
+  dashboard; they never degrade proxying. An existing pre-SQLite
+  `stats.json` snapshot is migrated into `stats.db` automatically on first
+  start.
 
 ## Security model
 
@@ -99,11 +117,12 @@ make check      # gofmt, go vet, go mod tidy -diff
 make generate   # go generate ./... (hook, currently no directives)
 ```
 
-Layout: `cmd/goproxy` entrypoint; `internal/{store,sumdb,stats,proxy,ui,version}`.
+Layout: `cmd/goproxy` entrypoint; `internal/{store,sumdb,stats,history,proxy,ui,version}`.
 
 - `store` — disk cache + in-memory index
 - `sumdb` — checksum-database verification client
-- `stats` — counters, events, traffic, snapshots
+- `stats` — lock-free counters, events, traffic, recorder flush loop
+- `history` — long-term stats in SQLite (pure-Go driver, cgo-free)
 - `proxy` — GOPROXY protocol handlers
 - `ui` — embedded dashboard (vanilla JS, zero external assets)
 

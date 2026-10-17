@@ -129,7 +129,7 @@ func newTestEnv(t *testing.T, gosum func(path, ver string) ([]byte, error)) *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := stats.New("")
+	m := stats.New(nil)
 	p, err := New(st, db, m, upstream.URL, true, upstream.Client(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
@@ -315,7 +315,7 @@ func TestProxy_UnknownToChecksumDBServesUnverified(t *testing.T) {
 	}))
 	t.Cleanup(upstream.Close)
 
-	m := stats.New("")
+	m := stats.New(nil)
 	p, err := New(st, db, m, upstream.URL, true, upstream.Client(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
@@ -400,7 +400,7 @@ func TestProxy_EscapedModulePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := stats.New("")
+	m := stats.New(nil)
 	p, err := New(st, db, m, upstream.URL, true, upstream.Client(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
