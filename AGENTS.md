@@ -12,15 +12,18 @@ KEEP ALWAYS AGENTS.md and README.md up-to-date for correct documentation.
 ## Layout
 
 ```
-cmd/goproxy          entrypoint: flags, wiring, graceful shutdown
+cmd/goproxy          entrypoint: flags, env wiring, socket activation, idle exit,
+                     graceful shutdown
 internal/store       disk cache (standard download/ layout) + in-memory index
 internal/sumdb       checksum-database verification (x/mod sumdb client)
 internal/stats       lock-free counters, event ring, traffic buckets, recorder flush loop
 internal/history      long-term stats in SQLite (pure-Go driver, WAL, minute buckets)
 internal/proxy       GOPROXY protocol handlers (singleflight, verify, cache)
 internal/ui          embedded dashboard (static/, vanilla JS, no external assets)
+internal/systemd     LISTEN_FDS socket-activation listener intake (zero deps)
 internal/version     version injected via -ldflags
 systemd.nix          NixOS module: services.go-mod-proxy (persistent, hardened)
+systemd-socket.nix   NixOS fragment: socket-activated on-demand mode
 ```
 
 Storage model: zips stored as-received (already deflate-compressed) under
@@ -39,6 +42,17 @@ Security: misses are verified against sum.golang.org (note signature + tlog
 tree + tiles) before caching; mismatch refuses content (502); no record serves
 unverified; checksum-db outage fails closed when `-verify=true`.
 
+## Socket activation (env contract)
+
+Serving mode is resolved at startup: passed systemd sockets win, then an
+explicit `-addr` flag, then `BIND_ADDR`, then `:5100`. `SOCKET_ACTIVATION=1`
+declares socket-activated deployment (warns and falls back to binding when
+no descriptors were actually passed). `EXIT_ON_IDLE=1` (socket-activated
+mode only) exits cleanly once no request has been in flight for 30s — with
+the final stats flush and WAL checkpoint — since systemd re-arms the socket
+and restarts on demand. Combine it with `Restart=on-failure`, never
+`Restart=always` (idle exit is success and would loop otherwise).
+
 ## Deployment (NixOS)
 
 `systemd.nix` is a NixOS module fragment (same consumption pattern as
@@ -56,6 +70,14 @@ connect/DNS unaffected, no IP egress pinning since upstream fetch is the
 job), MemoryMax 512M / TasksMax 512 / LimitNOFILE 16384, full kernel/proc/
 keyring/namespace protection. The host side owns ingress (caddy vhost +
 listen IP, see ../nixos/server/all/go-mod-proxy01.nix).
+
+`systemd-socket.nix` is the alternative on-demand fragment: a socket unit
+owns `127.0.0.1:9091` and passes the descriptor via LISTEN_FDS
+(`SOCKET_ACTIVATION=1`); the service has no `wantedBy` (the socket triggers
+it), uses `Restart = on-failure` (idle exits are clean, must not loop) and
+`EXIT_ON_IDLE=1`; caddy targets the socket address, which keeps accepting
+while the service is down; `BIND_ADDR=127.0.0.1:9090` is the fallback for
+manual starts without passed sockets.
 
 ## Required Go skills
 
@@ -77,4 +99,7 @@ Notes: `-race` tests need `CGO_ENABLED=1` (dev/test only; the shipped binary is
 built `CGO_ENABLED=0`). Run a local instance with
 `./goproxy -addr 127.0.0.1:5100 -root /tmp/cache` and exercise it via
 `GOPROXY=http://127.0.0.1:5100 go mod download <mod>@<ver>`; watch `/api/dashboard`
-and `/api/history?range=24h` (also `7d`, `30d`, `1y`, `all`).
+and `/api/history?range=24h` (also `7d`, `30d`, `1y`, `all`). Socket-activated
+mode can be exercised without systemd: pass a listening fd as 3 with
+`LISTEN_FDS=1`, `LISTEN_PID=$$`, `SOCKET_ACTIVATION=1`, `EXIT_ON_IDLE=1`
+(internal/systemd/systemd_test.go re-executes the test binary this way).

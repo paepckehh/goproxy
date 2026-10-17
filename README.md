@@ -49,13 +49,39 @@ Then visit <http://localhost:5100/> in a browser.
 ## Configuration
 
 ```
--addr        :5100                     listen address
+-addr        (see below)                listen address
 -root        cache                     cache directory
 -upstream    https://proxy.golang.org  upstream module proxy
 -sumdb       https://sum.golang.org    checksum database base url
 -sumdb-key   (official key)            checksum database public key
 -verify      true                      verify hashes before caching
 ```
+
+Environment variables (used by the systemd units; flags win over env):
+
+```
+BIND_ADDR=127.0.0.1:9090    listen address when self-binding
+                            (-addr flag > BIND_ADDR > default :5100)
+SOCKET_ACTIVATION=1         serve on the sockets systemd passed via the
+                            LISTEN_FDS protocol; if none were passed, log a
+                            warning and fall back to BIND_ADDR
+EXIT_ON_IDLE=1             exit cleanly once no request has been in flight
+                            for 30s; only honored in socket-activated mode,
+                            where systemd re-arms the socket and restarts
+                            the proxy on the next connection
+```
+
+### Socket activation
+
+Under systemd the proxy can run socket-activated instead of resident:
+the socket unit owns the listening socket, starts the service on the
+first connection, passes the prepared descriptor via `LISTEN_FDS`, and
+the service exits after 30s of no in-flight requests (`EXIT_ON_IDLE=1`).
+The listening socket never goes away, so clients (and the caddy vhost,
+which must target the socket address) always get served; stats are
+flushed and `stats.db` checkpointed on every idle exit. Use
+`Restart = on-failure` for the service: idle exits are successful, and
+`Restart = always` would loop with `EXIT_ON_IDLE`.
 
 ## Storage model
 
@@ -117,7 +143,7 @@ make check      # gofmt, go vet, go mod tidy -diff
 make generate   # go generate ./... (hook, currently no directives)
 ```
 
-Layout: `cmd/goproxy` entrypoint; `internal/{store,sumdb,stats,history,proxy,ui,version}`.
+Layout: `cmd/goproxy` entrypoint; `internal/{store,sumdb,stats,history,proxy,ui,systemd,version}`.
 
 - `store` — disk cache + in-memory index
 - `sumdb` — checksum-database verification client
@@ -157,6 +183,19 @@ services.go-mod-proxy = {
   graceful-shutdown window
 
 Ingress (caddy vhost, TLS, listen IP) is host-side configuration.
+
+### Socket-activated alternative
+
+`systemd-socket.nix` is the same fragment wired for on-demand operation:
+a `systemd.sockets.go-mod-proxy` unit owns `127.0.0.1:9091` and starts
+the service with the descriptor passed via `LISTEN_FDS`
+(`SOCKET_ACTIVATION=1`). With `EXIT_ON_IDLE=1` the process serves the
+queued connection(s), then exits 30s after the last in-flight request —
+cleanly, with a final stats flush. `BIND_ADDR=127.0.0.1:9090` is only the
+fallback for manual starts without passed sockets, and the caddy vhost
+targets the socket (9091), which is accepting even while the service is
+down. The service uses `Restart = on-failure`: crashes restart, idle
+exits (code 0) stay down until the socket fires again.
 
 ## License
 

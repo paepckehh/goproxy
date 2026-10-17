@@ -23,12 +23,13 @@ import (
 	"paepcke.de/goproxy/internal/stats"
 	"paepcke.de/goproxy/internal/store"
 	"paepcke.de/goproxy/internal/sumdb"
+	"paepcke.de/goproxy/internal/systemd"
 	"paepcke.de/goproxy/internal/ui"
 	"paepcke.de/goproxy/internal/version"
 )
 
 func main() {
-	addr := flag.String("addr", ":5100", "listen address")
+	addr := flag.String("addr", "", "listen address (default :5100, env BIND_ADDR; systemd socket activation takes precedence)")
 	root := flag.String("root", "cache", "cache directory")
 	upstream := flag.String("upstream", "https://proxy.golang.org", "upstream module proxy")
 	sumdbURL := flag.String("sumdb", "https://sum.golang.org", "checksum database base url")
@@ -38,6 +39,7 @@ func main() {
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ver := version.Get()
+	listenAddr := resolveAddr(*addr)
 
 	st, err := store.New(*root)
 	if err != nil {
@@ -88,6 +90,30 @@ func main() {
 	}
 	uiH := ui.New(m, st, hist, ver)
 
+	// Socket activation: serve on the sockets systemd passed (LISTEN_FDS)
+	// when present; otherwise bind the resolved address. EXIT_ON_IDLE is
+	// honored in this mode because systemd keeps the socket and restarts
+	// the process on demand.
+	listeners, err := systemd.Listeners()
+	if err != nil {
+		log.Error("startup", "err", err)
+		os.Exit(1)
+	}
+	socketActivated := len(listeners) > 0
+	declaredActivation := envBool("SOCKET_ACTIVATION")
+	if declaredActivation && !socketActivated {
+		log.Warn("SOCKET_ACTIVATION=1 but no systemd sockets passed; binding", "addr", listenAddr)
+	}
+	exitOnIdle := envBool("EXIT_ON_IDLE") && (socketActivated || declaredActivation)
+	if envBool("EXIT_ON_IDLE") && !exitOnIdle {
+		log.Warn("EXIT_ON_IDLE=1 ignored: not socket-activated")
+	}
+
+	var track *connTracker
+	if exitOnIdle {
+		track = &connTracker{}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -113,19 +139,38 @@ func main() {
 	}()
 
 	srv := &http.Server{
-		Addr:              *addr,
+		Addr:              listenAddr,
 		Handler:           dispatch(p, uiH, ver),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	m.Started(ver, *addr)
+	if track != nil {
+		srv.ConnState = track.state
+	}
+	serveDesc := describeListeners(listenAddr, listeners)
+	m.Started(ver, serveDesc)
 
-	errCh := make(chan error, 1)
-	go func() {
-		log.Info("listening", "addr", *addr, "version", ver, "root", st.Root(),
-			"upstream", *upstream, "sumdb", *sumdbURL, "verify", *verify)
-		errCh <- srv.ListenAndServe()
-	}()
+	errCh := make(chan error, 1+len(listeners))
+	if socketActivated {
+		for _, l := range listeners {
+			go func(l net.Listener) {
+				errCh <- srv.Serve(l)
+			}(l)
+		}
+	} else {
+		go func() {
+			errCh <- srv.ListenAndServe()
+		}()
+	}
+
+	var idleExit <-chan struct{}
+	if exitOnIdle {
+		idleExit = watchIdle(ctx, track, idleGrace)
+	}
+
+	log.Info("listening", "addr", serveDesc, "socket-activated", socketActivated,
+		"exit-on-idle", exitOnIdle, "version", ver, "root", st.Root(),
+		"upstream", *upstream, "sumdb", *sumdbURL, "verify", *verify)
 
 	select {
 	case err := <-errCh:
@@ -134,6 +179,9 @@ func main() {
 			os.Exit(1)
 		}
 	case <-ctx.Done():
+	case <-idleExit:
+		log.Info("idle exit: no in-flight requests for " + idleGrace.String() +
+			" (systemd restarts on the next connection)")
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -150,6 +198,41 @@ func main() {
 		log.Error("closing stats database", "err", err)
 	}
 	log.Info("stopped")
+}
+
+// resolveAddr picks the self-bind address: an explicit -addr flag wins,
+// then the BIND_ADDR environment variable, then the default.
+func resolveAddr(flagAddr string) string {
+	if flagAddr != "" {
+		return flagAddr
+	}
+	if env := os.Getenv("BIND_ADDR"); env != "" {
+		return env
+	}
+	return ":5100"
+}
+
+// envBool reports whether an environment variable holds a truthy value.
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// describeListeners renders what the server serves: systemd-passed
+// sockets when socket-activated, otherwise the bound address.
+func describeListeners(addr string, listeners []net.Listener) string {
+	if len(listeners) == 0 {
+		return addr
+	}
+	addrs := make([]string, len(listeners))
+	for i, l := range listeners {
+		addrs[i] = l.Addr().String()
+	}
+	return "systemd (" + strings.Join(addrs, ", ") + ")"
 }
 
 // dispatch routes dashboard traffic to the ui and everything else to the
