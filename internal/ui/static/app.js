@@ -56,6 +56,20 @@ function countUp(id, target, format) {
 function renderHeader(s) {
   $("version").textContent = state.version;
   $("uptime").textContent = "uptime " + fmtUptime(s.uptimeSec);
+  renderWarn("persist-warn", s.persistErrors, (n) => n + " stats db write errors");
+  renderWarn("drop-warn", s.droppedEvents, (n) => n + " events dropped");
+}
+
+// Surface recorder trouble the backend already exposes: shown only > 0.
+function renderWarn(id, n, label) {
+  const el = $(id);
+  if (!el) return;
+  if (n > 0) {
+    el.textContent = label(n);
+    el.classList.add("show");
+  } else {
+    el.classList.remove("show");
+  }
 }
 
 function renderKPIs(s, store) {
@@ -160,6 +174,8 @@ const chart3d = {
   ctx: null,
   rot: 0.6,
   data: [],
+  w: 0,
+  h: 0,
 
   init() {
     this.canvas = $("chart3d");
@@ -167,13 +183,20 @@ const chart3d = {
     const fit = () => {
       const dpr = window.devicePixelRatio || 1;
       const r = this.canvas.getBoundingClientRect();
-      this.canvas.width = Math.max(50, r.width * dpr);
-      this.canvas.height = Math.max(50, r.height * dpr);
+      this.w = Math.max(50, r.width);
+      this.h = Math.max(50, r.height);
+      this.canvas.width = this.w * dpr;
+      this.canvas.height = this.h * dpr;
       this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     };
     new ResizeObserver(fit).observe(this.canvas);
     fit();
-    const loop = () => { this.draw(); requestAnimationFrame(loop); };
+    const loop = () => {
+      // Rotate only while the tab is visible; redraw once when it returns.
+      if (!document.hidden) this.rot += 0.0042;
+      this.draw();
+      requestAnimationFrame(loop);
+    };
     requestAnimationFrame(loop);
   },
 
@@ -188,8 +211,7 @@ const chart3d = {
     const c = Math.cos(this.rot), s = Math.sin(this.rot);
     const X = x * c - z * s;
     const Z = x * s + z * c;
-    const w = this.canvas.getBoundingClientRect().width;
-    const h = this.canvas.getBoundingClientRect().height;
+    const w = this.w, h = this.h;
     const fov = 700;
     const scale = fov / (fov + Z + 260);
     return { x: w / 2 + X * scale, y: h * 0.78 - y * scale, scale, z: Z };
@@ -197,14 +219,12 @@ const chart3d = {
 
   draw() {
     const ctx = this.ctx;
-    const w = this.canvas.getBoundingClientRect().width;
-    const h = this.canvas.getBoundingClientRect().height;
+    const w = this.w, h = this.h;
     ctx.clearRect(0, 0, w, h);
-    this.rot += 0.0042;
 
     const n = this.data.length;
     if (n === 0) {
-      ctx.fillStyle = "#7c8aa5";
+      ctx.fillStyle = "#8291ad";
       ctx.font = "13px ui-sans-serif, system-ui";
       ctx.textAlign = "center";
       ctx.fillText("no traffic yet — bars appear as modules are served", w / 2, h / 2);
@@ -269,14 +289,14 @@ const chart3d = {
 
       // Value above the bar.
       const labelY = this.project(b.x, b.height + 16, 0);
-      ctx.fillStyle = "#e2e8f0";
+      ctx.fillStyle = "#e6ecf7";
       ctx.font = "600 11px ui-monospace, monospace";
       ctx.textAlign = "center";
       ctx.fillText(fmtBytes(b.value), labelY.x, labelY.y);
 
       // Module name on the floor.
       const name = this.project(b.x, 0, 0);
-      ctx.fillStyle = "#7c8aa5";
+      ctx.fillStyle = "#8291ad";
       ctx.font = "10.5px ui-monospace, monospace";
       let text = b.label;
       while (text.length > 14 && ctx.measureText(text).width > spacing + 26) text = text.slice(1);
@@ -300,7 +320,7 @@ function drawTraffic(traffic) {
   ctx.clearRect(0, 0, w, h);
 
   if (!traffic || traffic.length < 2) {
-    ctx.fillStyle = "#7c8aa5";
+    ctx.fillStyle = "#8291ad";
     ctx.font = "13px ui-sans-serif, system-ui";
     ctx.textAlign = "center";
     ctx.fillText("waiting for traffic…", w / 2, h / 2);
@@ -342,7 +362,7 @@ function drawTraffic(traffic) {
   ctx.stroke();
 
   // Time ticks.
-  ctx.fillStyle = "#7c8aa5";
+  ctx.fillStyle = "#8291ad";
   ctx.font = "10px ui-monospace, monospace";
   ctx.textAlign = "left";
   ctx.fillText("-2m", pad.l, h - 4);
@@ -382,7 +402,7 @@ function drawHistory(payload) {
 
   const pts = payload.points || [];
   if (pts.length < 2) {
-    ctx.fillStyle = "#7c8aa5";
+    ctx.fillStyle = "#8291ad";
     ctx.font = "13px ui-sans-serif, system-ui";
     ctx.textAlign = "center";
     ctx.fillText(
@@ -440,7 +460,7 @@ function drawHistory(payload) {
   line((p) => p.storeBytes, "rgba(52, 211, 153, 0.9)");
 
   // Time ticks.
-  ctx.fillStyle = "#7c8aa5";
+  ctx.fillStyle = "#8291ad";
   ctx.font = "10px ui-monospace, monospace";
   ctx.textBaseline = "alphabetic";
   for (let i = 0; i <= 3; i++) {

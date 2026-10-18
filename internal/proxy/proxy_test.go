@@ -256,6 +256,39 @@ func TestProxy_VerifyFailureRefusesContent(t *testing.T) {
 	}
 }
 
+func TestProxy_PartialRecordVerifiesWhatItCan(t *testing.T) {
+	t.Parallel()
+	// A database record with only a zip line (custom databases): the zip
+	// is hash-verified, the go.mod is served unverified, nothing refused.
+	zipPath := filepath.Join(t.TempDir(), "m.zip")
+	if err := os.WriteFile(zipPath, buildModuleZip(t, testMod, testVer), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	zipHash, err := sumdb.HashZip(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := newTestEnv(t, func(path, ver string) ([]byte, error) {
+		return []byte(path + " " + strings.TrimSuffix(ver, "/go.mod") + " " + zipHash + "\n"), nil
+	})
+
+	rec := env.get(t, "/"+testMod+"/@v/"+testVer+".mod")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mod status = %d, want 200: no go.mod hash line is not tampering", rec.Code)
+	}
+	if f := env.store.Get(testMod, testVer, store.KindMod); f == nil || f.Verified {
+		t.Fatal("go.mod cached as verified without a signed go.mod hash")
+	}
+
+	rec = env.get(t, "/"+testMod+"/@v/"+testVer+".zip")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("zip status = %d, want 200", rec.Code)
+	}
+	if f := env.store.Get(testMod, testVer, store.KindZip); f == nil || !f.Verified {
+		t.Fatal("zip with matching signed hash not verified")
+	}
+}
+
 func TestProxy_ListAndLatestPassThrough(t *testing.T) {
 	t.Parallel()
 	env := newTestEnv(t, nil)

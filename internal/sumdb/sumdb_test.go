@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -64,15 +65,71 @@ func TestDB_LookupVerified(t *testing.T) {
 
 func TestDB_LookupUnknown(t *testing.T) {
 	t.Parallel()
+	// os.ErrNotExist maps to 404 on the wire, like sum.golang.org for
+	// unknown modules: the client must read that as ErrUnknown.
+	// (The test server's reportError matches the raw sentinel only.)
 	db := newTestDB(t, func(path, ver string) ([]byte, error) {
-		return nil, errors.New("not found")
+		return nil, fs.ErrNotExist
 	})
 
 	_, err := db.Lookup("example.com/unknown", "v1.0.0")
-	if err == nil {
-		t.Fatal("expected error for unknown module")
+	if !errors.Is(err, ErrUnknown) {
+		t.Fatalf("err = %v, want ErrUnknown", err)
 	}
-	t.Logf("unknown lookup err: %v (ErrUnknown match: %v)", err, errors.Is(err, ErrUnknown))
+}
+
+func TestDB_Tile404FailsClosed(t *testing.T) {
+	t.Parallel()
+	// A database whose lookups answer but whose tiles are missing must
+	// read as an outage (fail closed), never as "module unknown".
+	skey, vkey, err := note.GenerateKey(rand.Reader, "test.sumdb.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := sumdb.NewTestServer(skey, func(path, ver string) ([]byte, error) {
+		return recordLines(path, ver), nil
+	})
+	sumSrv := sumdb.NewServer(ts)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/tile/") {
+			http.NotFound(w, r)
+			return
+		}
+		sumSrv.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	db, err := New(srv.URL, vkey, t.TempDir(), srv.Client(), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Lookup("example.com/m", "v1.0.0")
+	if err == nil {
+		t.Fatal("expected error when tiles are unavailable")
+	}
+	if errors.Is(err, ErrUnknown) {
+		t.Fatalf("tile outage misclassified as unknown module (fail-open): %v", err)
+	}
+}
+
+func TestDB_LookupPartialRecord(t *testing.T) {
+	t.Parallel()
+	// A record holding only the zip line: the zip hash is passed through,
+	// the absent go.mod hash is reported as empty (not refused).
+	db := newTestDB(t, func(path, ver string) ([]byte, error) {
+		return []byte(path + " " + strings.TrimSuffix(ver, "/go.mod") + " h1:ziphash=\n"), nil
+	})
+
+	rec, err := db.Lookup("example.com/m", "v1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.ZipHash != "ziphash=" {
+		t.Errorf("zip hash = %q, want ziphash=", rec.ZipHash)
+	}
+	if rec.ModHash != "" {
+		t.Errorf("mod hash = %q, want empty", rec.ModHash)
+	}
 }
 
 func TestDB_LookupPassesHashesThrough(t *testing.T) {
@@ -225,7 +282,11 @@ func TestReadRemote404MapsToNotExist(t *testing.T) {
 	}
 	_, err = db.ReadRemote("/lookup/x@v1")
 	if err == nil || !strings.Contains(err.Error(), notFoundMarker) {
-		t.Errorf("err = %v, want not-found marker", err)
+		t.Errorf("lookup 404 err = %v, want not-found marker", err)
+	}
+	_, err = db.ReadRemote("/tile/8/0/x000/000")
+	if err == nil || strings.Contains(err.Error(), notFoundMarker) {
+		t.Errorf("tile 404 err = %v, want plain status error", err)
 	}
 }
 

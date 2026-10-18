@@ -34,7 +34,7 @@ Everything a fleet of build machines needs, in one dependency-free binary.
 | **Observable** | Embedded dashboard with zero external assets: hit ratio, bandwidth saved, traffic, store usage, top modules, live event feed, and 24h to all-time history charts |
 | **Persistent** | Lifetime counters, minute-resolution buckets and the event log survive reboots in SQLite (pure-Go driver, WAL journaling) |
 | **Deployable** | Socket activation with idle exit, hardened systemd units, NixOS modules, static cgo-free binary |
-| **Honest failure** | Checksum-database outages fail closed; recorder errors are surfaced as `persistErrors` on the dashboard and never degrade proxying |
+| **Honest failure** | Checksum-database outages fail closed (a missing tile is an outage, not an unknown module); recorder errors surface as warning pills on the dashboard (`persistErrors`, dropped events) and never degrade proxying |
 
 ## Quick start
 
@@ -171,6 +171,7 @@ are all checked. The downloaded zip/mod hash is compared against the record:
 | Match | cached, marked verified, record stored as provenance |
 | Mismatch | refused with `502`, never cached, flagged in the event feed |
 | No record (private or unpublished module) | served unverified, clearly marked |
+| Record without a hash line for this kind (custom databases) | served unverified, never refused |
 | Database unreachable with `verify=true` | the request fails closed |
 
 ## Long-term statistics

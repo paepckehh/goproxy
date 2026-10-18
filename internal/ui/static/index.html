@@ -8,6 +8,7 @@
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+<div class="bg-grid" aria-hidden="true"></div>
 <header>
   <div class="brand">
     <div class="logo">G</div>
@@ -20,6 +21,8 @@
     <span class="pill" id="version">v—</span>
     <span class="pill" id="uptime">uptime —</span>
     <span class="pill live"><i></i><span id="conn">live</span></span>
+    <span class="pill warn" id="persist-warn" title="stats database write failures; proxying is unaffected"></span>
+    <span class="pill warn" id="drop-warn" title="events dropped because the collector was too busy to accept them"></span>
   </div>
 </header>
 

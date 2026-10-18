@@ -44,14 +44,17 @@ systemd units use `/var/lib/goproxy/stats.db`): lifetime totals table, one
 bucket per minute (requests/hits/misses/bytes + store-size snapshots, kept
 forever) and the event log (pruned after 90d). The request hot path never
 touches the DB: atomics + buffered channel, batched flush every 30s plus a
-final flush+WAL checkpoint on shutdown; recorder errors surface as
-`persistErrors` on the dashboard and never degrade proxying. Legacy pre-SQLite
+final flush+WAL checkpoint on shutdown; recorder errors surface as warning
+pills in the dashboard header (`persistErrors`, dropped events) and never
+degrade proxying. Legacy pre-SQLite
 `stats.json` snapshots migrate into `stats.db` on first start (renamed to
 `stats.json.imported`).
 
 Security: misses are verified against sum.golang.org (note signature + tlog
-tree + tiles) before caching; mismatch refuses content (502); no record serves
-unverified; checksum-db outage fails closed when `-verify=true`. The
+tree + tiles) before caching; a hash mismatch refuses content (502); no
+record serves unverified; a record without a hash line for a kind (custom
+databases) serves that kind unverified, never refuses; checksum-db outages
+(including missing tiles) fail closed when `-verify=true`. The
 `/sumdb/<db>/...` endpoint forwards paths verbatim to the configured database
 only (its name must match, others get 404), so go clients can run their full
 verification through the proxy. Shared singleflight fetches are detached from

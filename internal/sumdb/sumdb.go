@@ -33,9 +33,13 @@ const DefaultKey = "sum.golang.org+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+s3Ux18htTT
 // ErrUnknown reports a module version not present in the checksum database.
 var ErrUnknown = errors.New("sumdb: module not in checksum database")
 
-// notFoundMarker is embedded in ReadRemote 404 errors; the x/mod client
-// wraps errors with %v, so the marker is matched as text in Lookup.
-const notFoundMarker = "not found"
+// notFoundMarker is embedded only in ReadRemote errors for /lookup 404s.
+// It is matched as text in Lookup because the x/mod client wraps errors
+// with %v, breaking errors.Is. The marker contains spaces, so neither a
+// module path nor a tile path (both space-free) can forge it: a 404 on a
+// tile fetch is a database outage and must fail closed, not read as
+// "module unknown".
+const notFoundMarker = "module not in checksum database"
 
 // ErrSecurity is returned when the checksum database misbehaves
 // (bad signature, inconsistent tree, failed proof).
@@ -100,7 +104,9 @@ func (db *DB) Lookup(mod, ver string) (*Record, error) {
 	zipLines, err := db.client.Lookup(mod, ver)
 	if err != nil {
 		// The x/mod client wraps errors with %v, breaking errors.Is;
-		// the "not found" marker is only produced by our own ReadRemote.
+		// the marker is only produced by our own ReadRemote for lookup
+		// 404s. Any other error (tile outage, bad signature, ...) fails
+		// closed via the caller.
 		if strings.Contains(err.Error(), notFoundMarker) {
 			return nil, ErrUnknown
 		}
@@ -171,7 +177,10 @@ func (db *DB) ReadRemote(path string) ([]byte, error) {
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, fmt.Errorf("sumdb: %s: %s", path, notFoundMarker)
+		if strings.HasPrefix(path, "/lookup/") {
+			return nil, fmt.Errorf("sumdb: %s: %s", path, notFoundMarker)
+		}
+		return nil, fmt.Errorf("sumdb: %s: status %d", path, resp.StatusCode)
 	case resp.StatusCode != http.StatusOK:
 		return nil, fmt.Errorf("sumdb: %s: status %d", path, resp.StatusCode)
 	}

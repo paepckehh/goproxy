@@ -331,17 +331,20 @@ func (p *Proxy) fetchZip(body io.Reader, mod, ver string, rec *sumdb.Record) (*f
 	if err != nil {
 		return nil, fmt.Errorf("proxy: hash %s@%s: %w", mod, ver, err)
 	}
-	if rec != nil && strings.TrimPrefix(hash, "h1:") != rec.ZipHash {
+	// A record without a zip line (custom databases) does not verify this
+	// kind; only a present hash that disagrees is tampering.
+	verified := rec != nil && rec.ZipHash != ""
+	if verified && strings.TrimPrefix(hash, "h1:") != rec.ZipHash {
 		return nil, &verifyError{detail: fmt.Sprintf("zip hash mismatch for %s@%s: got %s, want h1:%s", mod, ver, hash, rec.ZipHash)}
 	}
-	f, err := p.store.Put(mod, ver, store.KindZip, tmpPath, hash, rec != nil)
+	f, err := p.store.Put(mod, ver, store.KindZip, tmpPath, hash, verified)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: %w", err)
 	}
 	if rec != nil {
 		p.putRecord(mod, ver, rec)
 	}
-	return &fetchResult{file: f, bytesUp: size, verified: rec != nil}, nil
+	return &fetchResult{file: f, bytesUp: size, verified: verified}, nil
 }
 
 func (p *Proxy) fetchMod(body io.Reader, mod, ver string, rec *sumdb.Record) (*fetchResult, error) {
@@ -356,17 +359,20 @@ func (p *Proxy) fetchMod(body io.Reader, mod, ver string, rec *sumdb.Record) (*f
 	if err != nil {
 		return nil, fmt.Errorf("proxy: hash %s@%s: %w", mod, ver, err)
 	}
-	if rec != nil && strings.TrimPrefix(hash, "h1:") != rec.ModHash {
+	// A record without a go.mod line (custom databases) does not verify
+	// this kind; only a present hash that disagrees is tampering.
+	verified := rec != nil && rec.ModHash != ""
+	if verified && strings.TrimPrefix(hash, "h1:") != rec.ModHash {
 		return nil, &verifyError{detail: fmt.Sprintf("go.mod hash mismatch for %s@%s: got %s, want h1:%s", mod, ver, hash, rec.ModHash)}
 	}
-	f, err := p.store.PutBytes(mod, ver, store.KindMod, data, hash, rec != nil)
+	f, err := p.store.PutBytes(mod, ver, store.KindMod, data, hash, verified)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: %w", err)
 	}
 	if rec != nil {
 		p.putRecord(mod, ver, rec)
 	}
-	return &fetchResult{file: f, bytesUp: int64(len(data)), verified: rec != nil}, nil
+	return &fetchResult{file: f, bytesUp: int64(len(data)), verified: verified}, nil
 }
 
 func (p *Proxy) fetchInfo(body io.Reader, mod, ver string) (*fetchResult, error) {
