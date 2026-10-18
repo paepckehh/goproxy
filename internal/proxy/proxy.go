@@ -93,7 +93,10 @@ func New(st *store.Store, db *sumdb.DB, m *stats.Stats, upstream string, verify 
 	if log == nil {
 		log = slog.Default()
 	}
-	rp := httputil.NewSingleHostReverseProxy(db.Base())
+	// SetURL rewrites the outbound Host header too: sum.golang.org rejects
+	// requests that still carry the proxy's own Host.
+	base := db.Base()
+	rp := &httputil.ReverseProxy{Rewrite: func(r *httputil.ProxyRequest) { r.SetURL(base) }}
 	return &Proxy{
 		store:      st,
 		sumdb:      db,
@@ -107,9 +110,19 @@ func New(st *store.Store, db *sumdb.DB, m *stats.Stats, upstream string, verify 
 	}, nil
 }
 
-// ServeSumDB transparently forwards checksum database requests, so go
-// clients can run their own full verification through this proxy.
+// ServeSumDB forwards checksum database requests, so go clients can run
+// their own full verification through this proxy. The go protocol is
+// GET <proxy>/sumdb/<db>/<path>: the <path> is forwarded verbatim to the
+// configured database, so <db> must be its name.
 func (p *Proxy) ServeSumDB(w http.ResponseWriter, r *http.Request) {
+	rest, ok := strings.CutPrefix(r.URL.Path, "/sumdb/")
+	name, path, _ := strings.Cut(rest, "/")
+	if !ok || name != p.sumdb.Name() || path == "" {
+		http.NotFound(w, r)
+		return
+	}
+	r.URL.Path = "/" + path
+	r.URL.RawPath = ""
 	p.sumdbProxy.ServeHTTP(w, r)
 }
 
@@ -178,16 +191,23 @@ func (p *Proxy) serveVersioned(w http.ResponseWriter, r *http.Request, mod, ver 
 	}
 
 	key := mod + "@" + ver + ":" + string(kind)
-	v, err, shared := p.inflight.Do(key, func() (any, error) {
-		return p.fetch(r.Context(), mod, ver, kind)
+	// The shared download runs detached from this request's context: one
+	// client walking away must not abort the fetch every waiter shares,
+	// and a completed fetch still warms the cache.
+	fetched := false
+	v, err, _ := p.inflight.Do(key, func() (any, error) {
+		fetched = true
+		return p.fetch(context.WithoutCancel(r.Context()), mod, ver, kind)
 	})
 	if err != nil {
 		p.serveFetchError(w, err, mod, ver, kind, start)
 		return
 	}
 	res := v.(*fetchResult)
-	if res.fromCache || shared {
-		// A concurrent request populated the cache while we queued.
+	if res.fromCache || !fetched {
+		// This request queued on a concurrent fetch (or the cache was
+		// populated while we queued): serve it as a hit. The fetcher
+		// itself accounts the miss below.
 		p.serveFile(w, r, res.file, mod, ver, kind, start, true)
 		return
 	}
@@ -301,9 +321,10 @@ func (p *Proxy) fetchZip(body io.Reader, mod, ver string, rec *sumdb.Record) (*f
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath) // no-op after a successful commit
 	size, err := io.Copy(tmp, body)
+	serr := tmp.Sync() // the rename below must not outrun the data
 	cerr := tmp.Close()
-	if err != nil || cerr != nil {
-		return nil, errors.Join(err, cerr)
+	if err != nil || serr != nil || cerr != nil {
+		return nil, errors.Join(err, serr, cerr)
 	}
 
 	hash, err := sumdb.HashZip(tmpPath)

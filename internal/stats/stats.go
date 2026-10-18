@@ -17,6 +17,7 @@ const (
 	eventRingSize   = 512
 	trafficRingSize = 120 // two minutes of one-second buckets
 	eventChanSize   = 1024
+	pendingMax      = 8192 // event retry backlog cap; see append
 	defaultTick     = time.Second
 	defaultFlush    = 30 * time.Second
 )
@@ -260,9 +261,18 @@ func (s *Stats) append(ev Event) {
 		s.events = s.events[len(s.events)-eventRingSize:]
 	}
 	s.evMu.Unlock()
-	if s.rec != nil {
-		s.pending = append(s.pending, ev)
+	if s.rec == nil {
+		return
 	}
+	// ponytail: retry backlog cap; a recorder down for longer than this
+	// drops new events (counted as droppedEvents) instead of growing
+	// memory forever. Raise it only if the event log must survive longer
+	// outages.
+	if len(s.pending) >= pendingMax {
+		s.dropped.Add(1)
+		return
+	}
+	s.pending = append(s.pending, ev)
 }
 
 // flush persists the bucket delta since the last flush, the lifetime

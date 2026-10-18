@@ -3,6 +3,7 @@ package proxy
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -467,22 +468,90 @@ func TestProxy_SingleflightDeduplicates(t *testing.T) {
 	if got := env.upstreamHits.Load(); got != 1 {
 		t.Errorf("upstream saw %d requests, want 1 (singleflight)", got)
 	}
+
+	// The executing request accounts the one miss; the queued ones are hits.
+	tot := env.stats.Snapshot().Lifetime
+	if tot.Misses != 1 || tot.Hits != n-1 {
+		t.Errorf("totals: misses = %d, hits = %d, want 1, %d", tot.Misses, tot.Hits, n-1)
+	}
+}
+
+func TestProxy_ClientDisconnectDoesNotAbortFetch(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t, nil)
+
+	// A slow upstream, so the client can walk away mid-download.
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		env.upstreamHits.Add(1)
+		time.Sleep(150 * time.Millisecond)
+		fmt.Fprint(w, "module "+testMod+"\n\ngo 1.21\n")
+	}))
+	t.Cleanup(slow.Close)
+
+	p, err := New(env.store, env.sumdbDB, env.stats, slow.URL, false, slow.Client(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(p.ServeModule))
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/"+testMod+"/@v/"+testVer+".mod", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		resp, err := srv.Client().Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+
+	// The shared fetch must finish and warm the cache despite the cancel.
+	waitFor(t, func() bool { return env.store.Get(testMod, testVer, store.KindMod) != nil })
+
+	hits := env.upstreamHits.Load()
+	req2 := httptest.NewRequest(http.MethodGet, "/"+testMod+"/@v/"+testVer+".mod", nil)
+	rec := httptest.NewRecorder()
+	p.ServeModule(rec, req2)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 from the warmed cache", rec.Code)
+	}
+	if env.upstreamHits.Load() != hits {
+		t.Error("a disconnecting client aborted the shared fetch")
+	}
 }
 
 func TestProxy_SumDBForwarded(t *testing.T) {
 	t.Parallel()
 	env := newTestEnv(t, nil)
 
+	// The go protocol: <proxy>/sumdb/<db>/<path> forwards <path> verbatim
+	// to the checksum database <db>.
 	req := httptest.NewRequest(http.MethodGet, "/sumdb/test.sumdb.example/latest", nil)
 	rec := httptest.NewRecorder()
 	env.proxy.ServeSumDB(rec, req)
-	if rec.Code == http.StatusNotFound && strings.Contains(rec.Body.String(), "404") {
-		t.Logf("sumdb latest via reverse proxy: %d %q", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("latest: status %d, body %q", rec.Code, rec.Body.String())
 	}
-	// The exact body depends on the test server; asserting it responds at
-	// all through the reverse proxy is the contract.
-	if rec.Code == 0 {
-		t.Error("no response from sumdb reverse proxy")
+	if !strings.Contains(rec.Body.String(), "test.sumdb.example") {
+		t.Errorf("latest body = %q, want the signed tree head", rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/sumdb/test.sumdb.example/lookup/"+testMod+"@"+testVer, nil)
+	rec = httptest.NewRecorder()
+	env.proxy.ServeSumDB(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), testMod) {
+		t.Errorf("lookup: status %d, body %q", rec.Code, rec.Body.String())
+	}
+
+	// Any other database name must not be forwarded.
+	req = httptest.NewRequest(http.MethodGet, "/sumdb/evil.example/latest", nil)
+	rec = httptest.NewRecorder()
+	env.proxy.ServeSumDB(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("foreign db name: status %d, want 404", rec.Code)
 	}
 }
 

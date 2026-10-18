@@ -18,7 +18,8 @@ internal/store       disk cache (standard download/ layout) + in-memory index
 internal/sumdb       checksum-database verification (x/mod sumdb client)
 internal/stats       lock-free counters, event ring, traffic buckets, recorder flush loop
 internal/history      long-term stats in SQLite (pure-Go driver, WAL, minute buckets)
-internal/proxy       GOPROXY protocol handlers (singleflight, verify, cache)
+internal/proxy       GOPROXY protocol handlers (singleflight, verify, cache,
+                     fetches detached from client contexts)
 internal/ui          embedded dashboard (static/, vanilla JS, no external assets)
 internal/systemd     LISTEN_FDS socket-activation listener intake (zero deps)
 internal/version     version injected via -ldflags
@@ -40,7 +41,13 @@ final flush+WAL checkpoint on shutdown; recorder errors surface as
 
 Security: misses are verified against sum.golang.org (note signature + tlog
 tree + tiles) before caching; mismatch refuses content (502); no record serves
-unverified; checksum-db outage fails closed when `-verify=true`.
+unverified; checksum-db outage fails closed when `-verify=true`. The
+`/sumdb/<db>/...` endpoint forwards paths verbatim to the configured database
+only (its name must match, others get 404), so go clients can run their full
+verification through the proxy. Shared singleflight fetches are detached from
+the requesting client's context: one disconnecting client cannot abort the
+download the other waiters share, and a completed download still warms the
+cache.
 
 ## Socket activation (env contract)
 

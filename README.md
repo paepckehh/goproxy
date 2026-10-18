@@ -40,7 +40,7 @@ Then visit <http://localhost:5100/> in a browser.
 | `GET /<module>/@v/<v>.info`    | cached, JSON-validated                                |
 | `GET /<module>/@v/<v>.mod`     | cached, hash-verified against the checksum database   |
 | `GET /<module>/@v/<v>.zip`     | cached, hash-verified against the checksum database   |
-| `GET /sumdb/<db>/...`          | transparently forwarded, lets clients verify fully    |
+| `GET /sumdb/<db>/...`          | forwarded verbatim to the configured db only (404 otherwise) |
 | `GET /`                        | operations dashboard                                  |
 | `GET /api/dashboard`           | JSON: stats, store, modules, events (polled every 2s) |
 | `GET /api/history?range=...`  | JSON: long-term stats series (`24h`/`7d`/`30d`/`1y`/`all`) |

@@ -200,6 +200,21 @@ func TestStats_RecorderErrorsCountedNotFatal(t *testing.T) {
 	}
 }
 
+func TestStats_PendingBacklogCapped(t *testing.T) {
+	t.Parallel()
+	// A recorder that fails forever: the retry backlog must stop growing.
+	s := New(&fakeRecorder{fail: true})
+	for range pendingMax + 100 {
+		s.append(Event{Result: "hit"})
+	}
+	if len(s.pending) != pendingMax {
+		t.Errorf("pending backlog = %d, want capped at %d", len(s.pending), pendingMax)
+	}
+	if got := s.Snapshot().DroppedEvents; got != 100 {
+		t.Errorf("dropped events = %d, want 100", got)
+	}
+}
+
 func TestStats_SeedContinuesLifetimeAndFeed(t *testing.T) {
 	t.Parallel()
 	s := New(nil)

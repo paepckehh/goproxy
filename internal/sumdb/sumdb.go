@@ -87,6 +87,10 @@ func New(base, key, stateDir string, client *http.Client, log *slog.Logger) (*DB
 	return db, nil
 }
 
+// Name returns the checksum database name (e.g. "sum.golang.org"), the
+// prefix go clients use on the proxy's /sumdb/ endpoint.
+func (db *DB) Name() string { return db.name }
+
 // Lookup returns the verified checksum record for module@version.
 // Unknown module versions yield ErrUnknown.
 func (db *DB) Lookup(mod, ver string) (*Record, error) {
@@ -241,6 +245,11 @@ func writeFileAtomic(path string, data []byte) error {
 	}
 	defer os.Remove(tmp.Name())
 	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	// Sync before the rename below: a torn cache file would poison lookups.
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return err
 	}

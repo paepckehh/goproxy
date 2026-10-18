@@ -178,9 +178,10 @@ func (s *Store) PutBytes(mod, ver string, kind Kind, data []byte, hash string, v
 	}
 	defer os.Remove(tmp.Name()) // no-op once Put renamed it
 	_, werr := tmp.Write(data)
+	serr := tmp.Sync()
 	cerr := tmp.Close()
-	if werr != nil || cerr != nil {
-		return nil, errors.Join(werr, cerr)
+	if werr != nil || serr != nil || cerr != nil {
+		return nil, errors.Join(werr, serr, cerr)
 	}
 	return s.Put(mod, ver, kind, tmp.Name(), hash, verified)
 }
@@ -507,6 +508,12 @@ func writeFileAtomic(path string, data []byte) error {
 	}
 	defer os.Remove(tmp.Name())
 	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	// Sync before the rename below: a torn record sidecar would poison
+	// the backfilled hashes of every later index scan.
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return err
 	}
