@@ -35,6 +35,7 @@ func main() {
 	sumdbURL := flag.String("sumdb", "https://sum.golang.org", "checksum database base url")
 	sumdbKey := flag.String("sumdb-key", sumdb.DefaultKey, "checksum database public key")
 	verify := flag.Bool("verify", true, "verify module hashes against the checksum database")
+	statsDB := flag.String("stats-db", "", "absolute path of the long-term stats database (default <root>/stats.db, env STATS_DB)")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -52,16 +53,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Long-term stats: cgo-free SQLite, everything survives reboots.
-	hist, err := history.Open(filepath.Join(st.Root(), "stats.db"))
+	dbPath, err := resolveStatsDB(*statsDB, st.Root())
 	if err != nil {
 		log.Error("startup", "err", err)
 		os.Exit(1)
 	}
-	if imported, err := hist.ImportLegacyJSON(filepath.Join(st.Root(), "stats.json")); err != nil {
+
+	// Long-term stats: cgo-free SQLite, everything survives reboots.
+	hist, err := history.Open(dbPath)
+	if err != nil {
+		log.Error("startup", "err", err)
+		os.Exit(1)
+	}
+	if imported, err := hist.ImportLegacyJSON(filepath.Join(filepath.Dir(dbPath), "stats.json")); err != nil {
 		log.Warn("importing legacy stats snapshot", "err", err)
 	} else if imported {
-		log.Info("migrated stats.json into stats.db", "file", filepath.Join(st.Root(), "stats.json.imported"))
+		log.Info("migrated stats.json into stats.db", "file", filepath.Join(filepath.Dir(dbPath), "stats.json.imported"))
 	}
 	totals, err := hist.LoadTotals()
 	if err != nil {
@@ -169,7 +176,7 @@ func main() {
 	}
 
 	log.Info("listening", "addr", serveDesc, "socket-activated", socketActivated,
-		"exit-on-idle", exitOnIdle, "version", ver, "root", st.Root(),
+		"exit-on-idle", exitOnIdle, "version", ver, "root", st.Root(), "stats-db", dbPath,
 		"upstream", *upstream, "sumdb", *sumdbURL, "verify", *verify)
 
 	select {
@@ -210,6 +217,25 @@ func resolveAddr(flagAddr string) string {
 		return env
 	}
 	return ":5100"
+}
+
+// resolveStatsDB picks the SQLite stats database location: an explicit
+// -stats-db flag wins, then the STATS_DB environment variable, then
+// <root>/stats.db. An explicit location must be absolute so deployments
+// can keep the database in e.g. /var/lib/goproxy, separate from the
+// potentially huge and wipeable module cache.
+func resolveStatsDB(flagPath, root string) (string, error) {
+	path := flagPath
+	if path == "" {
+		path = os.Getenv("STATS_DB")
+	}
+	if path == "" {
+		return filepath.Join(root, "stats.db"), nil
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("stats database path %q must be absolute", path)
+	}
+	return path, nil
 }
 
 // envBool reports whether an environment variable holds a truthy value.

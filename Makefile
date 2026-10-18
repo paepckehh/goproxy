@@ -48,3 +48,9 @@ test:
 
 cloc:
 	go run github.com/boyter/scc/v4@latest
+
+release-check:
+	CGO_ENABLED=0 goreleaser check
+
+release-snapshot:
+	CGO_ENABLED=0 goreleaser release --snapshot --clean

@@ -30,7 +30,9 @@ systemd-socket.nix   NixOS fragment: socket-activated on-demand mode
 Storage model: zips stored as-received (already deflate-compressed) under
 `<root>/download/<escaped module>/@v/`; signed checksum records as `<version>.sum`
 sidecars; index fully in memory, rebuilt by parallel scan at startup. Long-term
-stats persist in `<root>/stats.db` (SQLite, WAL): lifetime totals table, one
+stats persist in the stats database (SQLite, WAL), default `<root>/stats.db`,
+overridable to an absolute path elsewhere via `-stats-db` / `STATS_DB` (the
+systemd units use `/var/lib/goproxy/stats.db`): lifetime totals table, one
 bucket per minute (requests/hits/misses/bytes + store-size snapshots, kept
 forever) and the event log (pruned after 90d). The request hot path never
 touches the DB: atomics + buffered channel, batched flush every 30s plus a
@@ -59,6 +61,22 @@ mode only) exits cleanly once no request has been in flight for 30s — with
 the final stats flush and WAL checkpoint — since systemd re-arms the socket
 and restarts on demand. Combine it with `Restart=on-failure`, never
 `Restart=always` (idle exit is success and would loop otherwise).
+
+## Stats database location
+
+`-stats-db` flag > `STATS_DB` env > `<root>/stats.db`. When set explicitly
+the path MUST be absolute (startup fails otherwise) so deployments can
+keep the SQLite database in persistent state storage (`/var/lib/goproxy`)
+separate from the wipeable module cache root. The legacy `stats.json`
+lookup follows the database directory.
+
+## Releases
+
+Public repo: github.com/paepckehh/goproxy. GoReleaser builds on every `v*`
+tag push (`.github/workflows/release.yml` + `.goreleaser.yml`, same pattern
+as ../zdash): cgo-free binaries for linux/freebsd/darwin amd64/arm64, tar.gz
+archives, deb/rpm packages, checksums. Local dry run: `make release-snapshot`,
+config check: `make release-check`.
 
 ## Deployment (NixOS)
 

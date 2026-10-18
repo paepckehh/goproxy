@@ -21,6 +21,11 @@ go build -o goproxy ./cmd/goproxy        # or: make build
 ./goproxy                                 # serves :5100, caches ./cache
 ```
 
+Released binaries are built by GoReleaser on every `v*` tag push
+(`.github/workflows/release.yml`, config in `.goreleaser.yml`):
+linux/freebsd/darwin, amd64/arm64, tar.gz archives plus deb/rpm packages
+(`make release-snapshot` for a local dry run).
+
 Point your toolchain at it and open the dashboard:
 
 ```sh
@@ -55,6 +60,9 @@ Then visit <http://localhost:5100/> in a browser.
 -sumdb       https://sum.golang.org    checksum database base url
 -sumdb-key   (official key)            checksum database public key
 -verify      true                      verify hashes before caching
+-stats-db    <root>/stats.db            absolute path of the long-term stats
+                                       database (env STATS_DB; must be
+                                       absolute when set)
 ```
 
 Environment variables (used by the systemd units; flags win over env):
@@ -69,6 +77,11 @@ EXIT_ON_IDLE=1             exit cleanly once no request has been in flight
                             for 30s; only honored in socket-activated mode,
                             where systemd re-arms the socket and restarts
                             the proxy on the next connection
+STATS_DB=/var/lib/goproxy/stats.db
+                            absolute path of the long-term stats database
+                            (-stats-db flag > STATS_DB > <root>/stats.db);
+                            must be absolute when set, so deployments can
+                            keep stats separate from the module cache
 ```
 
 ### Socket activation

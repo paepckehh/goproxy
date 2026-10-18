@@ -29,9 +29,13 @@
         BIND_ADDR = "127.0.0.1:9090";
         SOCKET_ACTIVATION = "1";
         EXIT_ON_IDLE = "1";
+        # keep the SQLite long-term stats database in /var/lib/goproxy,
+        # separate from the wipeable module cache root
+        STATS_DB = "/var/lib/goproxy/stats.db";
       };
       serviceConfig = {
         ExecStart = "/nix/persist/root/bin/goproxy";
+        StateDirectory = "goproxy";
         Type = "exec";
         # idle exits are clean (exit 0): only crashes restart. an idle
         # exit with Restart=always would loop every ~32s forever

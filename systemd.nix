@@ -17,8 +17,12 @@
     after = ["network-online.target"];
     startLimitIntervalSec = 0;
     environment.BIND_ADDR = "127.0.0.1:9090";
+    # keep the SQLite long-term stats database in /var/lib/goproxy,
+    # separate from the wipeable module cache root
+    environment.STATS_DB = "/var/lib/goproxy/stats.db";
     serviceConfig = {
       ExecStart = "/nix/persist/root/bin/goproxy";
+      StateDirectory = "goproxy";
       Type = "exec";
       Restart = "always";
       RestartSec = "2s";
