@@ -1,11 +1,16 @@
 # AGENTS.md
 
-`paepcke.de/goproxy` — single-binary go proxy.
-- modern single binary cgo runtime dependency free 
-- fast: modern caching go mod proxy 
-- secure: validates upstream signatures 
-- cool: modern 3d annimated bussines like dashboard about packages, sources, caching hits / miss , used and safed upstream downstream bandwide, store size, plus long-term (24h to all-time) history charts  
-- persistent: long-term stats in `<root>/stats.db`, SQLite via the pure-Go cgo-free driver `modernc.org/sqlite`; lifetime counters, minute-resolution buckets and the event log all survive reboots 
+`paepcke.de/goproxy` — single-binary go proxy, public mirror at
+github.com/paepckehh/goproxy, BSD-3-Clause (see LICENSE).
+- modern single binary, cgo and runtime dependency free
+- fast: modern caching go mod proxy
+- secure: validates upstream signatures
+- cool: modern 3D animated business-like dashboard about packages, sources,
+  cache hits/misses, upstream and downstream bandwidth used and saved, store
+  size, plus long-term (24h to all-time) history charts
+- persistent: long-term stats in the SQLite stats database via the pure-Go
+  cgo-free driver `modernc.org/sqlite`; lifetime counters, minute-resolution
+  buckets and the event log all survive reboots
 
 KEEP ALWAYS AGENTS.md and README.md up-to-date for correct documentation.
 
@@ -23,6 +28,9 @@ internal/proxy       GOPROXY protocol handlers (singleflight, verify, cache,
 internal/ui          embedded dashboard (static/, vanilla JS, no external assets)
 internal/systemd     LISTEN_FDS socket-activation listener intake (zero deps)
 internal/version     version injected via -ldflags
+.github/workflows    golang.yml (build/vet/test CI), release.yml (GoReleaser)
+.goreleaser.yml      release build config (tar.gz, deb, rpm, checksums)
+LICENSE              BSD-3-Clause
 systemd.nix          NixOS module: services.go-mod-proxy (persistent, hardened)
 systemd-socket.nix   NixOS fragment: socket-activated on-demand mode
 ```
@@ -75,8 +83,19 @@ lookup follows the database directory.
 Public repo: github.com/paepckehh/goproxy. GoReleaser builds on every `v*`
 tag push (`.github/workflows/release.yml` + `.goreleaser.yml`, same pattern
 as ../zdash): cgo-free binaries for linux/freebsd/darwin amd64/arm64, tar.gz
-archives, deb/rpm packages, checksums. Local dry run: `make release-snapshot`,
-config check: `make release-check`.
+archives, deb/rpm packages, checksums. CI (`.github/workflows/golang.yml`)
+builds, vets and tests every push to main. Local dry run:
+`make release-snapshot`, config check: `make release-check`.
+
+## Documentation contract
+
+AGENTS.md (repo layout, conventions, env contract) and README.md (user-facing:
+features, install, configuration, API, deployment) must always stay in sync
+with the code. When changing flags, env vars, endpoints, storage layout,
+unit behavior or release tooling, update both files in the same change.
+The README is the hyper-modern public face: badges, feature tables, quick
+start, configuration and API reference; keep claims verified against code,
+never aspirational.
 
 ## Deployment (NixOS)
 
