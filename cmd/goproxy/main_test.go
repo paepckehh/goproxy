@@ -1,40 +1,54 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
 
-func TestResolveStatsDB(t *testing.T) {
+func TestResolveRoot(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		flag    string
-		env     string
-		root    string
-		want    string
-		wantErr bool
+		name string
+		flag string
+		env  string
+		want string
 	}{
-		{name: "default in root", root: "/cache", want: filepath.Join("/cache", "stats.db")},
-		{name: "flag wins over env", flag: "/var/lib/goproxy/stats.db", env: "/other/db.sqlite", want: "/var/lib/goproxy/stats.db"},
-		{name: "env used", env: "/var/lib/goproxy/stats.db", want: "/var/lib/goproxy/stats.db"},
-		{name: "relative env rejected", env: "stats.db", wantErr: true},
-		{name: "relative flag rejected", flag: "db/stats.db", wantErr: true},
+		{name: "default", want: "cache"},
+		{name: "flag wins over env", flag: "/disk2/go/proxy", env: "/other/cache", want: "/disk2/go/proxy"},
+		{name: "env used", env: "/disk2/go/proxy", want: "/disk2/go/proxy"},
+		{name: "relative env allowed", env: "gocache", want: "gocache"},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("STATS_DB", tc.env)
-			got, err := resolveStatsDB(tc.flag, tc.root)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("resolveStatsDB(%q, %q) = %q, want error", tc.flag, tc.root, got)
-				}
-				return
+			t.Setenv("CACHE_ROOT", tc.env)
+			if got := resolveRoot(tc.flag); got != tc.want {
+				t.Fatalf("resolveRoot(%q) = %q, want %q", tc.flag, got, tc.want)
 			}
-			if err != nil {
-				t.Fatalf("resolveStatsDB(%q, %q) error: %v", tc.flag, tc.root, err)
-			}
-			if got != tc.want {
-				t.Fatalf("resolveStatsDB(%q, %q) = %q, want %q", tc.flag, tc.root, got, tc.want)
+		})
+	}
+}
+
+func TestResolveStatsDB(t *testing.T) {
+	stateDir := t.TempDir()
+	fileAsStateDir := filepath.Join(t.TempDir(), "notadir")
+	if err := os.WriteFile(fileAsStateDir, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		root     string
+		stateDir string
+		want     string
+	}{
+		{name: "state dir wins", root: "/cache", stateDir: stateDir, want: filepath.Join(stateDir, "stats.db")},
+		{name: "missing state dir falls back to cache root", root: "/cache",
+			stateDir: filepath.Join(t.TempDir(), "does", "not", "exist"), want: "/cache/stats.db"},
+		{name: "state dir file not dir falls back", root: "/cache",
+			stateDir: fileAsStateDir, want: "/cache/stats.db"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveStatsDB(tc.root, tc.stateDir); got != tc.want {
+				t.Fatalf("resolveStatsDB(%q, %q) = %q, want %q", tc.root, tc.stateDir, got, tc.want)
 			}
 		})
 	}

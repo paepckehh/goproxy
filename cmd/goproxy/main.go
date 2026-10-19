@@ -30,19 +30,18 @@ import (
 
 func main() {
 	addr := flag.String("addr", "", "listen address (default :5100, env BIND_ADDR; systemd socket activation takes precedence)")
-	root := flag.String("root", "cache", "cache directory")
+	root := flag.String("root", "", "module cache directory (default cache, env CACHE_ROOT)")
 	upstream := flag.String("upstream", "https://proxy.golang.org", "upstream module proxy")
 	sumdbURL := flag.String("sumdb", "https://sum.golang.org", "checksum database base url")
 	sumdbKey := flag.String("sumdb-key", sumdb.DefaultKey, "checksum database public key")
 	verify := flag.Bool("verify", true, "verify module hashes against the checksum database")
-	statsDB := flag.String("stats-db", "", "absolute path of the long-term stats database (default <root>/stats.db, env STATS_DB)")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ver := version.Get()
 	listenAddr := resolveAddr(*addr)
 
-	st, err := store.New(*root)
+	st, err := store.New(resolveRoot(*root))
 	if err != nil {
 		log.Error("startup", "err", err)
 		os.Exit(1)
@@ -53,11 +52,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	dbPath, err := resolveStatsDB(*statsDB, st.Root())
-	if err != nil {
-		log.Error("startup", "err", err)
-		os.Exit(1)
-	}
+	dbPath := resolveStatsDB(st.Root(), defaultStateDir)
 
 	// Long-term stats: cgo-free SQLite, everything survives reboots.
 	hist, err := history.Open(dbPath)
@@ -219,23 +214,34 @@ func resolveAddr(flagAddr string) string {
 	return ":5100"
 }
 
-// resolveStatsDB picks the SQLite stats database location: an explicit
-// -stats-db flag wins, then the STATS_DB environment variable, then
-// <root>/stats.db. An explicit location must be absolute so deployments
-// can keep the database in e.g. /var/lib/goproxy, separate from the
-// potentially huge and wipeable module cache.
-func resolveStatsDB(flagPath, root string) (string, error) {
-	path := flagPath
-	if path == "" {
-		path = os.Getenv("STATS_DB")
+// resolveRoot picks the module cache directory: an explicit -root flag
+// wins, then the CACHE_ROOT environment variable, then "cache". CACHE_ROOT
+// lets deployments put the (potentially huge, wipeable) module storage on a
+// dedicated path or disk without touching the command line.
+func resolveRoot(flagRoot string) string {
+	if flagRoot != "" {
+		return flagRoot
 	}
-	if path == "" {
-		return filepath.Join(root, "stats.db"), nil
+	if env := os.Getenv("CACHE_ROOT"); env != "" {
+		return env
 	}
-	if !filepath.IsAbs(path) {
-		return "", fmt.Errorf("stats database path %q must be absolute", path)
+	return "cache"
+}
+
+// defaultStateDir is the fixed home of the long-term stats database:
+// deployments create it via the systemd StateDirectory directive.
+const defaultStateDir = "/var/lib/goproxy"
+
+// resolveStatsDB picks the SQLite stats database location: the default
+// state directory (/var/lib/goproxy, normally provided by systemd) when it
+// exists, otherwise <root>/stats.db next to the module cache for
+// unprivileged local runs. The location is fixed policy, not configuration:
+// wiping the cache never wipes the history.
+func resolveStatsDB(root, stateDir string) string {
+	if fi, err := os.Stat(stateDir); err == nil && fi.IsDir() {
+		return filepath.Join(stateDir, "stats.db")
 	}
-	return path, nil
+	return filepath.Join(root, "stats.db")
 }
 
 // envBool reports whether an environment variable holds a truthy value.

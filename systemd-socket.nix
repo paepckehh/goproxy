@@ -29,9 +29,10 @@
         BIND_ADDR = "127.0.0.1:9090";
         SOCKET_ACTIVATION = "1";
         EXIT_ON_IDLE = "1";
-        # keep the SQLite long-term stats database in /var/lib/goproxy,
-        # separate from the wipeable module cache root
-        STATS_DB = "/var/lib/goproxy/stats.db";
+        # module storage on the dedicated cache disk; the long-term stats
+        # database stays in the default state dir (/var/lib/goproxy) via
+        # StateDirectory
+        CACHE_ROOT = "/nix/persist/cache/go/proxy";
       };
       serviceConfig = {
         ExecStart = "/nix/persist/root/bin/goproxy";

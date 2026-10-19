@@ -79,8 +79,7 @@ Flags (environment variables are used by the systemd units; flags win over env):
 | Flag | Default | Description |
 | --- | --- | --- |
 | `-addr` | `:5100` (env `BIND_ADDR`) | listen address; systemd socket activation takes precedence |
-| `-root` | `cache` | module cache directory |
-| `-stats-db` | `<root>/stats.db` (env `STATS_DB`) | absolute path of the long-term stats database; must be absolute when set, so the database can live in `/var/lib` apart from the cache |
+| `-root` | `cache` (env `CACHE_ROOT`) | module cache directory; the env var exists so deployments can put module storage on a dedicated path or disk, without touching the command line |
 | `-upstream` | `https://proxy.golang.org` | upstream module proxy |
 | `-sumdb` | `https://sum.golang.org` | checksum database base url |
 | `-sumdb-key` | official key | checksum database public key |
@@ -89,7 +88,7 @@ Flags (environment variables are used by the systemd units; flags win over env):
 | Environment | Effect |
 | --- | --- |
 | `BIND_ADDR` | listen address when self-binding (`-addr` flag wins, then this, then `:5100`) |
-| `STATS_DB` | stats database location (`-stats-db` flag wins, then this, then `<root>/stats.db`) |
+| `CACHE_ROOT` | module cache directory, e.g. a dedicated disk (`-root` flag wins, then this, then `cache`) |
 | `SOCKET_ACTIVATION=1` | serve on the sockets systemd passed via the `LISTEN_FDS` protocol; if none were passed, log a warning and fall back to `BIND_ADDR` |
 | `EXIT_ON_IDLE=1` | exit cleanly once no request has been in flight for 30s; only honored in socket-activated mode, where systemd re-arms the socket and restarts the proxy on the next connection |
 
@@ -145,7 +144,9 @@ share, and a completed download still warms the cache.
 <root>/download/<escaped module>/@v/<version>.info|.mod|.zip
 <root>/download/<escaped module>/@v/<version>.sum    signed checksum record
 <root>/sumdb/                                        verification state + tiles
-<root>/stats.db                                      long-term stats (SQLite, WAL)
+/var/lib/goproxy/stats.db                            long-term stats (SQLite, WAL)
+<root>/stats.db                                      (only when the state dir does not
+                                                     exist, e.g. unprivileged local runs)
 ```
 
 - Module zips are stored exactly as received, already deflate-compressed,
@@ -155,9 +156,10 @@ share, and a completed download still warms the cache.
 - The index lives entirely in memory and is rebuilt by a parallel directory
   walk at startup (~ms per 1000 files). Requests also fall back to a stat
   while the scan is still running, so there is no startup gap.
-- The stats database defaults to `<root>/stats.db` and can be moved anywhere
-  absolute via `STATS_DB` / `-stats-db` (the systemd units use
-  `/var/lib/goproxy/stats.db`), so wiping the cache never wipes the history.
+- The stats database lives in the default state directory
+  `/var/lib/goproxy` when it exists (systemd deployments create it via
+  `StateDirectory`), otherwise next to the cache at `<root>/stats.db`, so
+  wiping the cache never wipes the history.
 
 ## Verification model
 
@@ -227,10 +229,11 @@ services.go-mod-proxy = {
 
 - **binary** `/nix/persist/root/bin/goproxy` (default, override `bin`):
   `make build`, manual deploy
-- **cache** `/nix/persist/cache/go/proxy` (default, override `root`):
+- **cache** `/nix/persist/cache/go/proxy` via `CACHE_ROOT`, on the dedicated
+  cache disk:
   survives reboots, standard `download/` layout
-- **stats** `/var/lib/goproxy/stats.db` via `STATS_DB` +
-  `StateDirectory = "goproxy"`, separate from the wipeable cache
+- **stats** `/var/lib/goproxy/stats.db` via `StateDirectory = "goproxy"`
+  (automatic, no configuration), separate from the wipeable cache
 - **hardening**: whole FS read-only except the cache root and state
   directory, seccomp `@system-service` minus unneeded groups, zero
   capabilities (root only as a stable cache-owner identity), bind syscalls

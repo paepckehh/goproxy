@@ -38,9 +38,10 @@ systemd-socket.nix   NixOS fragment: socket-activated on-demand mode
 Storage model: zips stored as-received (already deflate-compressed) under
 `<root>/download/<escaped module>/@v/`; signed checksum records as `<version>.sum`
 sidecars; index fully in memory, rebuilt by parallel scan at startup. Long-term
-stats persist in the stats database (SQLite, WAL), default `<root>/stats.db`,
-overridable to an absolute path elsewhere via `-stats-db` / `STATS_DB` (the
-systemd units use `/var/lib/goproxy/stats.db`): lifetime totals table, one
+stats persist in the stats database (SQLite, WAL) in the default state dir
+`/var/lib/goproxy` when it exists (the systemd units get it via
+`StateDirectory`), else `<root>/stats.db` for unprivileged local runs:
+lifetime totals table, one
 bucket per minute (requests/hits/misses/bytes + store-size snapshots, kept
 forever) and the event log (pruned after 90d). The request hot path never
 touches the DB: atomics + buffered channel, batched flush every 30s plus a
@@ -73,13 +74,15 @@ the final stats flush and WAL checkpoint — since systemd re-arms the socket
 and restarts on demand. Combine it with `Restart=on-failure`, never
 `Restart=always` (idle exit is success and would loop otherwise).
 
-## Stats database location
+## Stats database and cache location
 
-`-stats-db` flag > `STATS_DB` env > `<root>/stats.db`. When set explicitly
-the path MUST be absolute (startup fails otherwise) so deployments can
-keep the SQLite database in persistent state storage (`/var/lib/goproxy`)
-separate from the wipeable module cache root. The legacy `stats.json`
-lookup follows the database directory.
+The stats database location is fixed policy, not configuration: `/var/lib/goproxy/stats.db`
+when the state dir exists (normally provided by systemd `StateDirectory`),
+otherwise `<root>/stats.db` next to the module cache. There is no flag or env
+var for it; wiping the cache never wipes the history. The module cache root
+itself is `-root` flag > `CACHE_ROOT` env (dedicated path/disk for module
+storage) > `cache`. The legacy `stats.json` lookup follows the database
+directory.
 
 ## Releases
 
