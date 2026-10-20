@@ -76,6 +76,12 @@ func main() {
 		log.Error("loading stats", "err", err)
 		os.Exit(1)
 	}
+	usage, err := hist.LoadModuleUsage()
+	if err != nil {
+		log.Error("loading module usage", "err", err)
+		os.Exit(1)
+	}
+	st.RestoreUsage(usage)
 	m := stats.New(hist, stats.WithStoreSampler(func() stats.StoreStat {
 		su := st.Summary()
 		return stats.StoreStat{
@@ -141,6 +147,20 @@ func main() {
 		m.Run(ctx)
 		close(statsDone)
 	}()
+	usageDone := make(chan struct{})
+	go func() {
+		defer close(usageDone)
+		tick := time.NewTicker(moduleFlushInterval)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				persistModuleUsage(hist, st, log)
+			}
+		}
+	}()
 
 	handler := dispatch(p, uiH, ver)
 	if debug {
@@ -204,6 +224,10 @@ func main() {
 	// stats database cleanly.
 	<-statsDone
 	<-histDone
+	<-usageDone
+	// Final module usage snapshot before the database closes, so a restart
+	// resumes the served-bandwidth totals where they left off.
+	persistModuleUsage(hist, st, log)
 	if err := hist.Close(); err != nil {
 		log.Error("closing stats database", "err", err)
 		exitCode = 1
@@ -213,6 +237,18 @@ func main() {
 		// Preserve the failure for systemd after the final stats flush
 		// and database checkpoint instead of exiting from the select.
 		os.Exit(exitCode)
+	}
+}
+
+// moduleFlushInterval bounds how much per-module access accounting a crash
+// can lose; the counters are always written once more on shutdown.
+const moduleFlushInterval = 30 * time.Second
+
+// persistModuleUsage writes the modules that saw traffic since the last
+// flush, so the dashboard's served-bandwidth ranking survives restarts.
+func persistModuleUsage(hist *history.DB, st *store.Store, log *slog.Logger) {
+	if err := hist.SaveModuleUsage(st.TakeUsage()); err != nil {
+		log.Warn("persisting module usage", "err", err)
 	}
 }
 

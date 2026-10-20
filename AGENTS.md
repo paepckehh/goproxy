@@ -11,7 +11,8 @@ github.com/paepckehh/goproxy, BSD-3-Clause (see LICENSE).
   downstream bandwidth used and saved, store size, plus long-term (24h to
   all-time) history charts
 - persistent: long-term stats in the SQLite stats database via the pure-Go
-  cgo-free driver `modernc.org/sqlite`; lifetime counters, minute-resolution
+  cgo-free driver `modernc.org/sqlite`; lifetime counters, per-module
+  served-bandwidth totals, minute-resolution
   buckets and the event log all survive reboots
 
 KEEP ALWAYS AGENTS.md and README.md up-to-date for correct documentation.
@@ -47,7 +48,10 @@ stats persist in the stats database (SQLite, WAL) in the default state dir
 `StateDirectory`), else `<root>/stats.db` for unprivileged local runs:
 lifetime totals table, one
 bucket per minute (requests/hits/misses/bytes + store-size snapshots, kept
-forever) and the event log (pruned after 90d). The dashboard is driven
+forever), per-module access counters (requests/bytes served/last use,
+flushed every 30s so the cache table and top-modules bandwidth chart keep
+their totals across restarts) and the event log (pruned after 90d). The
+dashboard is driven
 entirely by one Server-Sent Events stream (`/api/events?range=`): it seeds
 the event ring, counters, cache table and the selected history series on
 connect, then pushes each new event, the counters every 2s, the cache table

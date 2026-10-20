@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"paepcke.de/goproxy/internal/stats"
+	"paepcke.de/goproxy/internal/store"
 )
 
 func open(t *testing.T) *DB {
@@ -40,6 +41,38 @@ func TestHistory_TotalsRoundtrip(t *testing.T) {
 	}
 	if got != (stats.Totals{Hits: 3}) {
 		t.Errorf("totals = %+v, want overwrite with hits 3", got)
+	}
+}
+
+func TestHistory_ModuleUsageRoundtrip(t *testing.T) {
+	t.Parallel()
+	db := open(t)
+
+	want := map[string]store.ModuleUsage{
+		"a.example/x": {Requests: 2, Served: 150, LastUsed: time.Unix(1700000000, 0).UTC()},
+		"b.example/y": {Requests: 7, Served: 4096},
+	}
+	if err := db.SaveModuleUsage(want); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveModuleUsage(map[string]store.ModuleUsage{
+		"a.example/x": {Requests: 3, Served: 200, LastUsed: time.Unix(1700000100, 0).UTC()},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.LoadModuleUsage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("usage = %+v, want 2 modules", got)
+	}
+	if u := got["a.example/x"]; u.Requests != 3 || u.Served != 200 ||
+		!u.LastUsed.Equal(time.Unix(1700000100, 0)) {
+		t.Errorf("usage a = %+v, want upserted counters", u)
+	}
+	if u := got["b.example/y"]; u.Requests != 7 || u.Served != 4096 || !u.LastUsed.IsZero() {
+		t.Errorf("usage b = %+v, want untouched counters", u)
 	}
 }
 

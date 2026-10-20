@@ -24,6 +24,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"paepcke.de/goproxy/internal/stats"
+	"paepcke.de/goproxy/internal/store"
 )
 
 const (
@@ -113,6 +114,12 @@ func migrate(db *sql.DB) error {
 			detail TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS events_time ON events (time)`,
+		`CREATE TABLE IF NOT EXISTS module_usage (
+			path TEXT PRIMARY KEY,
+			requests INTEGER NOT NULL DEFAULT 0,
+			served_bytes INTEGER NOT NULL DEFAULT 0,
+			last_used INTEGER NOT NULL DEFAULT 0
+		)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("history: migrate: %w", err)
@@ -242,6 +249,69 @@ func (d *DB) LoadTotals() (stats.Totals, error) {
 		return stats.Totals{}, fmt.Errorf("history: load totals: %w", err)
 	}
 	return t, nil
+}
+
+// SaveModuleUsage upserts per-module access counters. Absolute values are
+// written, so a later restart restores the lifetime served bandwidth the
+// dashboard's top-modules chart shows.
+func (d *DB) SaveModuleUsage(usage map[string]store.ModuleUsage) error {
+	if len(usage) == 0 {
+		return nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("history: module usage: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT INTO module_usage (path, requests, served_bytes, last_used)
+		VALUES (?,?,?,?)
+		ON CONFLICT (path) DO UPDATE SET
+			requests = excluded.requests,
+			served_bytes = excluded.served_bytes,
+			last_used = excluded.last_used`)
+	if err != nil {
+		return fmt.Errorf("history: module usage: %w", err)
+	}
+	defer stmt.Close()
+	for path, u := range usage {
+		var lastUsed int64
+		if !u.LastUsed.IsZero() {
+			lastUsed = u.LastUsed.Unix()
+		}
+		if _, err := stmt.Exec(path, u.Requests, u.Served, lastUsed); err != nil {
+			return fmt.Errorf("history: module usage: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("history: module usage: %w", err)
+	}
+	return nil
+}
+
+// LoadModuleUsage returns the persisted per-module access counters.
+func (d *DB) LoadModuleUsage() (map[string]store.ModuleUsage, error) {
+	rows, err := d.db.Query(`SELECT path, requests, served_bytes, last_used FROM module_usage`)
+	if err != nil {
+		return nil, fmt.Errorf("history: module usage: %w", err)
+	}
+	defer rows.Close()
+	usage := make(map[string]store.ModuleUsage)
+	for rows.Next() {
+		var path string
+		var u store.ModuleUsage
+		var lastUsed int64
+		if err := rows.Scan(&path, &u.Requests, &u.Served, &lastUsed); err != nil {
+			return nil, fmt.Errorf("history: module usage: %w", err)
+		}
+		if lastUsed != 0 {
+			u.LastUsed = time.Unix(lastUsed, 0).UTC()
+		}
+		usage[path] = u
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("history: module usage: %w", err)
+	}
+	return usage, nil
 }
 
 // RecordBucket upserts one minute of activity (stats.Recorder): counter

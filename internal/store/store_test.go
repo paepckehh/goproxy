@@ -235,6 +235,49 @@ func TestStore_ModulesStats(t *testing.T) {
 	if ms[0].LastUsed.IsZero() {
 		t.Error("last used not tracked")
 	}
+
+	usage := s.TakeUsage()
+	if got := usage["a.example/x"]; got.Requests != 2 || got.Served != 150 {
+		t.Fatalf("take usage = %+v, want 2 requests, 150 bytes", got)
+	}
+	if again := s.TakeUsage(); len(again) != 0 {
+		t.Errorf("second take = %+v, want no unchanged modules", again)
+	}
+}
+
+func TestStore_UsageSurvivesRestart(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+
+	if _, err := s.PutBytes("a.example/x", "v1.0.0", KindZip, []byte("zip\n"), "", true); err != nil {
+		t.Fatal(err)
+	}
+	f, err := s.Open("a.example/x", "v1.0.0", KindZip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.RecordHit(4096)
+
+	fresh, err := New(s.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh.RestoreUsage(s.TakeUsage())
+	if _, err := fresh.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ms := fresh.Modules()
+	if len(ms) != 1 || ms[0].Requests != 1 || ms[0].Served != 4096 {
+		t.Fatalf("restored modules = %+v, want 1 request, 4096 bytes served", ms)
+	}
+	f2, err := fresh.Open("a.example/x", "v1.0.0", KindZip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f2.RecordHit(1024)
+	if ms = fresh.Modules(); ms[0].Served != 5120 {
+		t.Errorf("served after restore = %d, want 5120", ms[0].Served)
+	}
 }
 
 func TestStore_ConcurrentAccess(t *testing.T) {

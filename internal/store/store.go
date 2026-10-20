@@ -42,7 +42,7 @@ const (
 // ErrNotFound reports a cache miss.
 var ErrNotFound = errors.New("store: not found")
 
-// File is one cached file plus its hot access counters.
+// File is one cached file plus its provenance.
 type File struct {
 	Path      string
 	Size      int64
@@ -50,34 +50,50 @@ type File struct {
 	Verified  bool   // hash was checked against the signed record
 	FetchedAt time.Time
 
-	requests atomic.Int64
-	served   atomic.Int64
-	lastUsed atomic.Int64 // unix nanoseconds
+	usage *moduleUsage
 }
 
-// Requests returns how many times the file was served.
-func (f *File) Requests() int64 { return f.requests.Load() }
-
-// Served returns the total bytes served for this file.
-func (f *File) Served() int64 { return f.served.Load() }
-
-// LastUsed returns the time of the last hit, or the zero time.
-func (f *File) LastUsed() time.Time {
-	if n := f.lastUsed.Load(); n != 0 {
-		return time.Unix(0, n)
-	}
-	return time.Time{}
-}
-
-// RecordHit accounts one served response of the given size.
+// RecordHit accounts one served response of the given size on the module
+// aggregate, so access statistics survive index rebuilds and restarts.
 func (f *File) RecordHit(size int64) {
-	f.requests.Add(1)
-	f.served.Add(size)
-	f.lastUsed.Store(time.Now().UnixNano())
+	if f.usage != nil {
+		f.usage.record(size)
+	}
 }
 
 // Open opens the cached file for reading.
 func (f *File) Open() (*os.File, error) { return os.Open(f.Path) }
+
+// moduleUsage holds the access counters of one module. The store persists
+// a snapshot through TakeUsage, which only returns modules with new hits.
+type moduleUsage struct {
+	requests atomic.Int64
+	served   atomic.Int64
+	lastUsed atomic.Int64 // unix nanoseconds
+	dirty    atomic.Bool
+}
+
+func (u *moduleUsage) record(size int64) {
+	u.requests.Add(1)
+	u.served.Add(size)
+	u.lastUsed.Store(time.Now().UnixNano())
+	u.dirty.Store(true)
+}
+
+func (u *moduleUsage) snapshot() ModuleUsage {
+	su := ModuleUsage{Requests: u.requests.Load(), Served: u.served.Load()}
+	if n := u.lastUsed.Load(); n != 0 {
+		su.LastUsed = time.Unix(0, n).UTC()
+	}
+	return su
+}
+
+// ModuleUsage is the persisted per-module access counter set.
+type ModuleUsage struct {
+	Requests int64     `json:"requests"`
+	Served   int64     `json:"servedBytes"`
+	LastUsed time.Time `json:"lastUsed"`
+}
 
 // Version groups the cached files of one module version.
 type Version struct {
@@ -97,9 +113,10 @@ type Module struct {
 
 // Store is a disk-backed module cache with an in-memory index.
 type Store struct {
-	root string
-	mu   sync.RWMutex
-	mods map[string]*Module
+	root  string
+	mu    sync.RWMutex
+	mods  map[string]*Module
+	usage map[string]*moduleUsage
 }
 
 // New creates the store directory tree and returns an empty index.
@@ -114,7 +131,11 @@ func New(root string) (*Store, error) {
 			return nil, fmt.Errorf("store: create %s: %w", dir, err)
 		}
 	}
-	return &Store{root: abs, mods: make(map[string]*Module)}, nil
+	return &Store{
+		root:  abs,
+		mods:  make(map[string]*Module),
+		usage: make(map[string]*moduleUsage),
+	}, nil
 }
 
 // Root returns the absolute cache root.
@@ -296,22 +317,57 @@ func (s *Store) Modules() []ModStat {
 	out := make([]ModStat, 0, len(s.mods))
 	for _, m := range s.mods {
 		ms := ModStat{Path: m.Path, Versions: len(m.Versions)}
+		if u := s.usage[m.Path]; u != nil {
+			ms.Requests = u.requests.Load()
+			ms.Served = u.served.Load()
+			if n := u.lastUsed.Load(); n != 0 {
+				ms.LastUsed = time.Unix(0, n).UTC()
+			}
+		}
 		for _, v := range m.Versions {
 			for _, f := range v.files() {
 				ms.Size += f.Size
-				ms.Requests += f.Requests()
-				ms.Served += f.Served()
 				if f.Verified {
 					ms.Verified = true
-				}
-				if lu := f.LastUsed(); lu.After(ms.LastUsed) {
-					ms.LastUsed = lu
 				}
 			}
 		}
 		out = append(out, ms)
 	}
 	slices.SortFunc(out, func(a, b ModStat) int { return cmp.Compare(b.Served, a.Served) })
+	return out
+}
+
+// RestoreUsage seeds the per-module access counters from persistent
+// storage before the cache index is scanned. Counters recorded later add
+// to the restored totals, so the dashboard keeps its history across
+// restarts.
+func (s *Store) RestoreUsage(usage map[string]ModuleUsage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for path, u := range usage {
+		mu := &moduleUsage{}
+		mu.requests.Store(u.Requests)
+		mu.served.Store(u.Served)
+		if !u.LastUsed.IsZero() {
+			mu.lastUsed.Store(u.LastUsed.UnixNano())
+		}
+		s.usage[path] = mu
+	}
+}
+
+// TakeUsage returns the modules whose access counters changed since the
+// last call and marks them clean, so the persistence loop only writes
+// modules that saw traffic.
+func (s *Store) TakeUsage() map[string]ModuleUsage {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]ModuleUsage)
+	for path, u := range s.usage {
+		if u.dirty.Swap(false) {
+			out[path] = u.snapshot()
+		}
+	}
 	return out
 }
 
@@ -419,6 +475,7 @@ func walkDirs(ctx context.Context, root string, dirs *[]string) error {
 func (s *Store) addFile(mod, ver string, kind Kind, f *File) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	f.usage = s.usageFor(mod)
 	v := s.version(mod, ver)
 	switch kind {
 	case KindInfo:
@@ -452,6 +509,17 @@ func (s *Store) version(mod, ver string) *Version {
 		m.Versions[ver] = v
 	}
 	return v
+}
+
+// usageFor returns (creating if needed) the access counters of a module.
+// Callers hold mu.
+func (s *Store) usageFor(path string) *moduleUsage {
+	u := s.usage[path]
+	if u == nil {
+		u = &moduleUsage{}
+		s.usage[path] = u
+	}
+	return u
 }
 
 // files returns the version's cached files, skipping absent kinds.

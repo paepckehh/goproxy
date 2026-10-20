@@ -214,6 +214,9 @@ WAL journaling), so the single binary stays cgo-free. It holds:
 
 - **lifetime totals**: restored at startup, continued, never reset;
   including neighbour-cache hits/misses and peer bandwidth
+- **per-module access counters**: requests, bytes served and last use,
+  restored at startup so the cache table and the top-modules bandwidth
+  chart keep their ranking across restarts and deployments
 - **one bucket per minute** of requests, hits, misses, bytes up/down/saved,
   verifications and cache-store size snapshots; kept forever (~half a
   million rows per year), aggregated into the 24h/7d/30d/1y and all-time
