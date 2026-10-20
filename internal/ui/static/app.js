@@ -224,7 +224,7 @@ function escapeHTML(s) {
 // ---- 3D rotating bar chart: top modules by served bandwidth ----
 const AGENDA_MAX = 8;
 
-// Color by rank, not by rotation depth, so the fixed agenda always
+// Color by rank, not by rotation depth, so the fixed side agenda always
 // matches the bars.
 function barColor(i, n) {
   const t = n <= 1 ? 0.5 : i / (n - 1);
@@ -367,8 +367,8 @@ const chart3d = {
   },
 };
 
-// Non-rotating agenda: module names stay readable while the 3D scene
-// turns. The rank and swatch match the bar index.
+// Non-rotating agenda beside the 3D scene: module names stay readable
+// while it turns. The rank and swatch match the bar index.
 function renderAgenda(data) {
   const ul = $("chart3d-agenda");
   if (!ul) return;

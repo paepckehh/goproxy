@@ -286,16 +286,33 @@ header {
   background:
     radial-gradient(70% 90% at 50% 100%, rgba(99, 102, 241, 0.14), transparent 70%);
 }
-/* Non-rotating legend for the 3D bars: names stay readable while the
-   scene turns. Colors match the bars, which are ordered by value. */
+/* 3D stage: rotating bars on the left, a static agenda on the right.
+   Module names never enter the 3D scene, so they stay readable while it
+   turns. Colors match the bars, which are ordered by value. */
+.chart3d-stage {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 210px;
+  gap: 14px;
+  align-items: stretch;
+  min-height: 300px;
+}
 .chart-agenda {
   list-style: none;
   margin: 0;
-  padding: 10px 0 0;
+  padding: 4px 0 0;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 4px 18px;
+  grid-template-columns: 1fr;
+  align-content: start;
+  gap: 6px;
   font-size: 11.5px;
+  overflow: hidden;
+}
+@media (max-width: 1360px) {
+  .chart3d-stage { grid-template-columns: 1fr; }
+  .chart-agenda {
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 4px 18px;
+  }
 }
 .chart-agenda li {
   display: flex;
