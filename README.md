@@ -54,7 +54,7 @@ Open <http://localhost:5100/> and watch the archive work.
 
 ## The dashboard
 
-One embedded page, zero external assets, one Server-Sent Events stream. No polling, no client-side refresh timer, no CDN. KPIs, top modules, client rankings, neighbour health, pre-cache sync details, long-term history, a live event feed and a rotating 3D bandwidth chart.
+One embedded page, zero external assets, one Server-Sent Events stream. No polling, no client-side refresh timer, no CDN. KPIs, top modules, client rankings, neighbour health, pre-cache sync details, long-term history, a live event feed and a rotating 3D bandwidth chart. The header logo links to the project page at <https://paepcke.de/goproxy>, the version pill to the repository at <https://github.com/paepckehh/goproxy>.
 
 | Operations | History |
 |:---:|:---:|

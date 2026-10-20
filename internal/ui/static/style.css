@@ -87,6 +87,8 @@ header {
 }
 
 .brand { display: flex; align-items: center; gap: 15px; }
+.brand a.logo { text-decoration: none; color: #04060d; transition: transform 0.2s ease, box-shadow 0.2s ease; }
+.brand a.logo:hover { transform: perspective(600px) rotateX(4deg) rotateZ(-2deg) translateY(-1px); box-shadow: 0 4px 8px rgba(0, 0, 0, 0.55), 0 14px 38px rgba(99, 102, 241, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.4); }
 .logo {
   width: 46px;
   height: 46px;
@@ -125,6 +127,8 @@ header {
   font-size: 12px;
   color: var(--muted);
 }
+.pill[href] { text-decoration: none; transition: color 0.2s ease, border-color 0.2s ease, background 0.2s ease; }
+.pill[href]:hover { color: var(--text); border-color: var(--border-hi); background: var(--panel-hi); }
 .pill.live { color: var(--green); }
 .pill.live i {
   width: 8px;

@@ -48,6 +48,8 @@ internal/fleet       neighbour-cache health probes (/healthz, startup + every 10
 internal/ui          embedded dashboard (static/, vanilla JS, no external assets);
                      push-only: every update arrives over SSE (/api/events),
                      no fetches, no polling, no client-side refresh timers;
+                     header logo links to paepcke.de/goproxy, the version
+                     pill to github.com/paepckehh/goproxy;
                      responsive KPI grid (4/2/1 columns), deep-linkable sections
                      (#clients, #history); screenshot_test.go + testdata/ render
                      the README images

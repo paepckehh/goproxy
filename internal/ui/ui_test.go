@@ -62,6 +62,9 @@ func TestUI_IndexServesDashboard(t *testing.T) {
 	if !strings.Contains(body, "goproxy") || !strings.Contains(body, "/static/app.js") {
 		t.Error("dashboard html incomplete")
 	}
+	if !strings.Contains(body, `href="https://paepcke.de/goproxy"`) || !strings.Contains(body, `href="https://github.com/paepckehh/goproxy"`) {
+		t.Error("dashboard html missing the project links")
+	}
 	if !strings.Contains(body, "chart-history") {
 		t.Error("dashboard html missing the long-term history section")
 	}
