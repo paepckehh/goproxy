@@ -203,6 +203,33 @@ func TestHistory_RangeSummaryAndBounds(t *testing.T) {
 	}
 }
 
+func TestHistory_RangeSummaryGrowthFromEmptyCache(t *testing.T) {
+	t.Parallel()
+	db := open(t)
+	base := time.Now().UTC().Truncate(time.Minute)
+	if err := db.RecordBucket(stats.Bucket{
+		Bucket: base,
+		Totals: stats.Totals{Hits: 1},
+		Store:  stats.StoreStat{Bytes: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordBucket(stats.Bucket{
+		Bucket: base.Add(time.Minute),
+		Totals: stats.Totals{Hits: 1},
+		Store:  stats.StoreStat{Bytes: 100},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := db.RangeSummary(base, base.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.StoreStart != 0 || s.StoreEnd != 100 {
+		t.Fatalf("store range = %d -> %d, want 0 -> 100", s.StoreStart, s.StoreEnd)
+	}
+}
+
 func TestHistory_ReopenPersistsEverything(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

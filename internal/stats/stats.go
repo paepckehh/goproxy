@@ -18,6 +18,7 @@ const (
 	trafficRingSize = 120 // two minutes of one-second buckets
 	eventChanSize   = 1024
 	pendingMax      = 8192 // event retry backlog cap; see append
+	maxEventText    = 512  // covers the longest valid module path, bounds hostile input
 	defaultTick     = time.Second
 	defaultFlush    = 30 * time.Second
 )
@@ -197,7 +198,7 @@ func (s *Stats) Seed(t Totals, newestFirst []Event) {
 	s.verifyFailed.Add(t.VerifyFailures)
 	s.evMu.Lock()
 	for i := len(newestFirst) - 1; i >= 0; i-- {
-		s.events = append(s.events, newestFirst[i])
+		s.events = append(s.events, trimEvent(newestFirst[i]))
 	}
 	if len(s.events) > eventRingSize {
 		s.events = s.events[len(s.events)-eventRingSize:]
@@ -213,12 +214,13 @@ func (s *Stats) Run(ctx context.Context) {
 	defer tick.Stop()
 	defer flush.Stop()
 
-	// Baseline the tick diffs and bucket deltas at the already-restored
-	// lifetime counters, so a restart does not emit one giant synthetic
-	// bucket.
-	lastHits, lastMisses, lastBytes := s.hits.Load(), s.misses.Load(), s.bytesDown.Load()
+	// Baseline the tick diffs and bucket deltas at the restored lifetime
+	// counters, so a restart does not emit one giant synthetic bucket.
+	// Activity recorded between Seed and Run still belongs to this
+	// session's first bucket and traffic tick.
+	lastHits, lastMisses, lastBytes := s.loaded.Hits, s.loaded.Misses, s.loaded.BytesDown
 	s.flushMu.Lock()
-	s.lastFlush = s.totals()
+	s.lastFlush = s.loaded
 	s.flushMu.Unlock()
 	for {
 		select {
@@ -255,6 +257,7 @@ func (s *Stats) Run(ctx context.Context) {
 }
 
 func (s *Stats) append(ev Event) {
+	ev = trimEvent(ev)
 	s.evMu.Lock()
 	s.events = append(s.events, ev)
 	if len(s.events) > eventRingSize {
@@ -403,7 +406,26 @@ func verifiedText(v bool) string {
 	return "unverified: not in checksum db"
 }
 
+// trimEvent keeps hostile request paths from turning the in-memory feed or
+// the 90-day SQLite event log into a memory/disk amplifier. The limit is
+// above the maximum valid module path length, so real data is untouched.
+func trimEvent(ev Event) Event {
+	ev.Module = trimText(ev.Module)
+	ev.Version = trimText(ev.Version)
+	ev.Kind = trimText(ev.Kind)
+	ev.Detail = trimText(ev.Detail)
+	return ev
+}
+
+func trimText(s string) string {
+	if len(s) <= maxEventText {
+		return s
+	}
+	return s[:maxEventText] + "..."
+}
+
 func (s *Stats) send(ev Event) {
+	ev = trimEvent(ev)
 	select {
 	case s.evCh <- ev:
 	default:

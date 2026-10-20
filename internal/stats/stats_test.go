@@ -3,6 +3,7 @@ package stats
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -182,6 +183,48 @@ func TestStats_RecorderFlush(t *testing.T) {
 	}
 	if len(events) != 2 {
 		t.Errorf("flushed events = %d, want 2", len(events))
+	}
+}
+
+func TestStats_PreRunActivityIsRecorded(t *testing.T) {
+	t.Parallel()
+	rec := &fakeRecorder{}
+	s := fastCollector(rec)
+	s.Hit("example.com/m", "v1.0.0", "zip", 100, time.Millisecond)
+	stop := run(t, s)
+	defer stop()
+
+	waitFor(t, func() bool {
+		buckets, _, _ := rec.snapshot()
+		var hits int64
+		for _, b := range buckets {
+			hits += b.Hits
+		}
+		return hits == 1
+	})
+	waitFor(t, func() bool {
+		var hits int64
+		for _, b := range s.Snapshot().Traffic {
+			hits += b.Hits
+		}
+		return hits == 1
+	})
+}
+
+func TestStats_EventFieldsAreBounded(t *testing.T) {
+	t.Parallel()
+	s := New(nil)
+	long := strings.Repeat("x", maxEventText*4)
+	s.Error(long, long, long)
+	ev := <-s.evCh
+	for name, got := range map[string]string{
+		"module": ev.Module,
+		"kind":   ev.Kind,
+		"detail": ev.Detail,
+	} {
+		if len(got) > maxEventText+3 {
+			t.Errorf("%s length = %d, want <= %d", name, len(got), maxEventText+3)
+		}
 	}
 }
 

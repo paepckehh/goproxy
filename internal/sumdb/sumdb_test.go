@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -75,6 +76,41 @@ func TestDB_LookupUnknown(t *testing.T) {
 	_, err := db.Lookup("example.com/unknown", "v1.0.0")
 	if !errors.Is(err, ErrUnknown) {
 		t.Fatalf("err = %v, want ErrUnknown", err)
+	}
+}
+
+func TestDB_TransientLookupErrorIsRetried(t *testing.T) {
+	t.Parallel()
+	skey, vkey, err := note.GenerateKey(rand.Reader, "test.sumdb.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := sumdb.NewTestServer(skey, func(path, ver string) ([]byte, error) {
+		return recordLines(path, ver), nil
+	})
+	base := sumdb.NewServer(ts)
+	var fail atomic.Bool
+	fail.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/lookup/") && fail.CompareAndSwap(true, false) {
+			http.Error(w, "temporary outage", http.StatusServiceUnavailable)
+			return
+		}
+		base.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	db, err := New(srv.URL, vkey, filepath.Join(t.TempDir(), "sumdb-state"), srv.Client(), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Lookup("example.com/m", "v1.0.0"); err == nil {
+		t.Fatal("first lookup succeeded, want the injected outage")
+	}
+	// The x/mod client caches the failed lookup. A transient outage must
+	// not poison this module version for the lifetime of the process.
+	if _, err := db.Lookup("example.com/m", "v1.0.0"); err != nil {
+		t.Fatalf("lookup did not recover after the transient outage: %v", err)
 	}
 }
 

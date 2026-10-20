@@ -27,7 +27,7 @@ deploy-test-nix: update build
 	sudo cp -af /nix/persist/root/bin/$(PROJECT)-pilot.old /nix/persist/root/bin/$(PROJECT)-pilot.old2 || true 
 	sudo cp -af /nix/persist/root/bin/$(PROJECT)-pilot /nix/persist/root/bin/$(PROJECT)-pilot.old || true 
 	sudo systemctl stop $(PROJECT)3.service || true
-	sudo mv -f ./chrony /nix/persist/root/bin/chrony-pilot || true
+	sudo cp -af ./$(PROJECT) /nix/persist/root/bin/$(PROJECT)-pilot
 	sudo systemctl start $(PROJECT)3.service
 
 deps:
@@ -36,7 +36,7 @@ deps:
 	go mod tidy -v
 	git config core.fileMode false
 check:
-	gofmt -l .
+	@files="$$(gofmt -l .)"; if [ -n "$$files" ]; then echo "$$files"; exit 1; fi
 	go vet ./...
 	go mod tidy -diff
 

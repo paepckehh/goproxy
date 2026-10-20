@@ -174,11 +174,12 @@ func main() {
 		"exit-on-idle", exitOnIdle, "version", ver, "root", st.Root(), "stats-db", dbPath,
 		"upstream", *upstream, "sumdb", *sumdbURL, "verify", *verify)
 
+	exitCode := 0
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, http.ErrServerClosed) {
 			log.Error("server", "err", err)
-			os.Exit(1)
+			exitCode = 1
 		}
 	case <-ctx.Done():
 	case <-idleExit:
@@ -190,6 +191,7 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("shutdown", "err", err)
+		exitCode = 1
 	}
 	stop()
 	// Wait for the collector to flush its final bucket, then close the
@@ -198,8 +200,14 @@ func main() {
 	<-histDone
 	if err := hist.Close(); err != nil {
 		log.Error("closing stats database", "err", err)
+		exitCode = 1
 	}
 	log.Info("stopped")
+	if exitCode != 0 {
+		// Preserve the failure for systemd after the final stats flush
+		// and database checkpoint instead of exiting from the select.
+		os.Exit(exitCode)
+	}
 }
 
 // resolveAddr picks the self-bind address: an explicit -addr flag wins,
@@ -294,6 +302,7 @@ func dispatch(p *proxy.Proxy, uiH *ui.Handler, ver string) http.Handler {
 func moduleClient() *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
 			DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 30 * time.Second,

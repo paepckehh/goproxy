@@ -216,6 +216,41 @@ func TestProxy_ZipRoundtrip(t *testing.T) {
 	}
 }
 
+func TestProxy_InfoVersionValidated(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"wrong version", `{"Version":"v9.9.9","Time":"2024-01-01T00:00:00Z"}`},
+		{"null", `null`},
+		{"empty object", `{}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := newTestEnv(t, nil)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, tc.body)
+			}))
+			t.Cleanup(upstream.Close)
+
+			p, err := New(env.store, env.sumdbDB, env.stats, upstream.URL, false, upstream.Client(), slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodGet, "/"+testMod+"/@v/"+testVer+".info", nil)
+			rec := httptest.NewRecorder()
+			p.ServeModule(rec, req)
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502 for invalid info body, body %q", rec.Code, rec.Body.String())
+			}
+			if env.store.Get(testMod, testVer, store.KindInfo) != nil {
+				t.Fatal("invalid .info response was cached")
+			}
+		})
+	}
+}
+
 func TestProxy_InfoRoundtrip(t *testing.T) {
 	t.Parallel()
 	env := newTestEnv(t, nil)
@@ -324,6 +359,29 @@ func TestProxy_UpstreamNotFoundAndNegativeCache(t *testing.T) {
 	}
 	if env.upstreamHits.Load() != hits {
 		t.Error("negative cache did not suppress upstream request")
+	}
+}
+
+func TestProxy_NegativeCacheExpires(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t, nil)
+	env.proxy.setNegative(testMod, testVer, store.KindMod, http.StatusNotFound)
+	if got := env.proxy.negative(testMod, testVer, store.KindMod); got != http.StatusNotFound {
+		t.Fatalf("negative status = %d, want 404", got)
+	}
+
+	key := negKey(testMod, testVer, store.KindMod)
+	env.proxy.negMu.Lock()
+	env.proxy.neg[key] = negEntry{code: http.StatusNotFound, expires: time.Now().Add(-time.Second)}
+	env.proxy.negMu.Unlock()
+	if got := env.proxy.negative(testMod, testVer, store.KindMod); got != 0 {
+		t.Fatalf("expired negative status = %d, want a miss", got)
+	}
+	env.proxy.negMu.Lock()
+	_, present := env.proxy.neg[key]
+	env.proxy.negMu.Unlock()
+	if present {
+		t.Fatal("expired negative entry was not removed")
 	}
 }
 
@@ -571,6 +629,18 @@ func TestProxy_SumDBForwarded(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "test.sumdb.example") {
 		t.Errorf("latest body = %q, want the signed tree head", rec.Body.String())
 	}
+	if passes := env.stats.Snapshot().Lifetime.Passes; passes == 0 {
+		t.Error("sumdb forwarding was not counted in the stats")
+	}
+
+	// The go client only uses a proxy for checksum-database traffic when
+	// this probe answers 200; forwarding it upstream would yield 404.
+	req = httptest.NewRequest(http.MethodGet, "/sumdb/test.sumdb.example/supported", nil)
+	rec = httptest.NewRecorder()
+	env.proxy.ServeSumDB(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("supported: status %d, want 200", rec.Code)
+	}
 
 	req = httptest.NewRequest(http.MethodGet, "/sumdb/test.sumdb.example/lookup/"+testMod+"@"+testVer, nil)
 	rec = httptest.NewRecorder()
@@ -585,6 +655,68 @@ func TestProxy_SumDBForwarded(t *testing.T) {
 	env.proxy.ServeSumDB(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("foreign db name: status %d, want 404", rec.Code)
+	}
+}
+
+func TestProxy_SumDBNameWithPath(t *testing.T) {
+	t.Parallel()
+	const name = "test.sumdb.example/sub"
+	skey, vkey, err := note.GenerateKey(rand.Reader, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sumSrv := httptest.NewServer(xsumdb.NewServer(xsumdb.NewTestServer(skey, func(path, ver string) ([]byte, error) {
+		return []byte(path + " " + ver + " h1:zip=\n"), nil
+	})))
+	t.Cleanup(sumSrv.Close)
+
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sumdb.New(sumSrv.URL, vkey, filepath.Join(t.TempDir(), "state"), sumSrv.Client(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(st, db, stats.New(nil), "http://upstream.invalid", false, sumSrv.Client(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/sumdb/"+name+"/latest", nil)
+	rec := httptest.NewRecorder()
+	p.ServeSumDB(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), name) {
+		t.Fatalf("status %d, body %q; want the signed tree head for %s", rec.Code, rec.Body.String(), name)
+	}
+}
+
+// fakeReadFromWriter implements io.ReaderFrom so the countingWriter's
+// optimized path can be exercised without a real TCP connection.
+type fakeReadFromWriter struct {
+	header http.Header
+	body   bytes.Buffer
+}
+
+func (w *fakeReadFromWriter) Header() http.Header { return w.header }
+func (w *fakeReadFromWriter) Write(p []byte) (int, error) {
+	return w.body.Write(p)
+}
+func (w *fakeReadFromWriter) WriteHeader(int) {}
+func (w *fakeReadFromWriter) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(&w.body, r)
+}
+
+func TestCountingWriterReadFrom(t *testing.T) {
+	t.Parallel()
+	w := &fakeReadFromWriter{header: make(http.Header)}
+	cw := &countingWriter{ResponseWriter: w}
+	n, err := io.Copy(cw, strings.NewReader("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 || cw.n != 5 || w.body.String() != "hello" {
+		t.Fatalf("copy = %d, counted %d, body %q; want 5, 5, hello", n, cw.n, w.body.String())
 	}
 }
 

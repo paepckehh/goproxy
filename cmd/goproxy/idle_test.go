@@ -75,7 +75,12 @@ func TestConnTrackerHTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	// The keep-alive connection stays open but idle: not busy.
+	// The keep-alive connection stays open but idle: not busy. The server
+	// reports the transition asynchronously, so give it a moment.
+	deadline := time.Now().Add(2 * time.Second)
+	for tr.busy.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if got := tr.busy.Load(); got != 0 {
 		t.Errorf("busy after request = %d, want 0", got)
 	}

@@ -6,7 +6,7 @@
     enable = true;
     # target the systemd socket, not the service: the socket keeps
     # accepting (and re-spawns the service) even while it has idled out
-    virtualHosts."goproxy".extraConfig = "proxy 127.0.0.1:9091";
+    virtualHosts."goproxy".extraConfig = "reverse_proxy 127.0.0.1:9091";
   };
 
   #################
@@ -81,11 +81,8 @@
         ];
         SocketBindDeny = "any";
         SocketBindAllow = "tcp:9090";
-        IPAddressDeny = [ "any" ];
-        IPAddressAllow = [
-          "127.0.0.0/8"
-          "::1"
-        ];
+        # Egress deliberately unrestricted: fetching and verifying from the
+        # upstream proxy and sum.golang.org is the service's job.
       };
     };
   };

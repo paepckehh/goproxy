@@ -483,7 +483,7 @@ function renderHistorySummary(s) {
   if (s.verifyFailures > 0) {
     chips.push(`<span class="hstat"><b>${fmtNum(s.verifyFailures)}</b> refusals</span>`);
   }
-  if (s.storeStart > 0 && s.storeEnd > 0) {
+  if ((s.storeStart || 0) > 0 || (s.storeEnd || 0) > 0) {
     const growth = s.storeEnd - s.storeStart;
     const sign = growth >= 0 ? "+" : "-";
     chips.push(
@@ -513,11 +513,17 @@ async function fetchHistory() {
   }
 }
 
+// Dashboard polls can overlap on a slow backend; only the newest response
+// may render, otherwise counters would jump backwards.
+let pollSeq = 0;
+
 async function poll() {
+  const seq = ++pollSeq;
   try {
     const resp = await fetch("/api/dashboard", { cache: "no-store" });
     if (!resp.ok) throw new Error("status " + resp.status);
     const data = await resp.json();
+    if (seq !== pollSeq) return; // superseded by a newer poll
     state.version = data.version;
     state.stats = data.stats;
     state.store = data.store;
@@ -530,7 +536,7 @@ async function poll() {
     drawTraffic(data.stats.traffic);
     setConn(true);
   } catch (err) {
-    setConn(false);
+    if (seq === pollSeq) setConn(false);
   }
 }
 

@@ -103,7 +103,7 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 | `GET /<module>/@v/<v>.info` | cached, JSON-validated |
 | `GET /<module>/@v/<v>.mod` | cached, hash-verified against the checksum database |
 | `GET /<module>/@v/<v>.zip` | cached, hash-verified against the checksum database |
-| `GET /sumdb/<db>/...` | forwarded verbatim to the configured database only (404 otherwise), so go clients run their full verification through the proxy |
+| `GET /sumdb/<db>/...` | forwarded verbatim to the configured database only (404 otherwise), with the `/supported` probe answered locally, so go clients run their full verification through the proxy |
 | `GET /` | operations dashboard (live, polls `/api/dashboard` every 2s) |
 | `GET /api/dashboard` | JSON: stats, store, modules, events |
 | `GET /api/history?range=24h` | long-term stats series (`24h`, `7d`, `30d`, `1y`, `all`) |
@@ -158,8 +158,9 @@ share, and a completed download still warms the cache.
   while the scan is still running, so there is no startup gap.
 - The stats database lives in the default state directory
   `/var/lib/goproxy` when it exists (systemd deployments create it via
-  `StateDirectory`), otherwise next to the cache at `<root>/stats.db`, so
-  wiping the cache never wipes the history.
+  `StateDirectory`), otherwise next to the cache at `<root>/stats.db` for
+  unprivileged runs. Wiping the module cache leaves a systemd-managed
+  history untouched; the local fallback is lost with the cache.
 
 ## Verification model
 

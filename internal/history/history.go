@@ -365,10 +365,10 @@ func (d *DB) RangeSummary(from, to time.Time) (Summary, error) {
 			COALESCE(SUM(bytes_down), 0), COALESCE(SUM(bytes_up), 0),
 			COALESCE(SUM(bytes_saved), 0),
 			(SELECT store_bytes FROM buckets
-			 WHERE bucket >= ? AND bucket < ? AND store_bytes > 0
+			 WHERE bucket >= ? AND bucket < ?
 			 ORDER BY bucket LIMIT 1),
 			(SELECT store_bytes FROM buckets
-			 WHERE bucket >= ? AND bucket < ? AND store_bytes > 0
+			 WHERE bucket >= ? AND bucket < ?
 			 ORDER BY bucket DESC LIMIT 1)
 		FROM buckets WHERE bucket >= ? AND bucket < ?`,
 		from.Unix(), to.Unix(), from.Unix(), to.Unix(), from.Unix(), to.Unix()).

@@ -57,8 +57,10 @@ record serves unverified; a record without a hash line for a kind (custom
 databases) serves that kind unverified, never refuses; checksum-db outages
 (including missing tiles) fail closed when `-verify=true`. The
 `/sumdb/<db>/...` endpoint forwards paths verbatim to the configured database
-only (its name must match, others get 404), so go clients can run their full
-verification through the proxy. Shared singleflight fetches are detached from
+only (its name must match, others get 404), answers the go client's
+`/sumdb/<db>/supported` probe locally, and records forwarded traffic in the
+stats. Go clients can therefore run their full verification through the
+proxy. Shared singleflight fetches are detached from
 the requesting client's context: one disconnecting client cannot abort the
 download the other waiters share, and a completed download still warms the
 cache.
@@ -82,7 +84,9 @@ bundled units bound crash loops with `startLimitBurst = 3` within
 The stats database location is fixed policy, not configuration: `/var/lib/goproxy/stats.db`
 when the state dir exists (normally provided by systemd `StateDirectory`),
 otherwise `<root>/stats.db` next to the module cache. There is no flag or env
-var for it; wiping the cache never wipes the history. The module cache root
+var for it; systemd deployments keep the database outside the cache, so
+wiping the cache leaves the history intact (an unprivileged fallback stored
+next to the cache is lost with it). The module cache root
 itself is `-root` flag > `CACHE_ROOT` env (dedicated path/disk for module
 storage) > `cache`. The legacy `stats.json` lookup follows the database
 directory.

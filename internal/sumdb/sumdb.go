@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/mod/module"
@@ -54,13 +55,20 @@ type Record struct {
 
 // DB is a checksum database client with persisted verification state.
 type DB struct {
-	base   *url.URL
-	key    string
-	name   string
-	dir    string
-	http   *http.Client
-	log    *slog.Logger
-	client *sumdb.Client
+	base *url.URL
+	key  string
+	name string
+	dir  string
+	http *http.Client
+	log  *slog.Logger
+
+	// clientMu guards client. The x/mod client caches every lookup result,
+	// including transient network and tile errors, for the lifetime of the
+	// client. A long-running proxy must throw such a client away after a
+	// failed lookup or one temporary outage would poison that module
+	// version until the process restarts.
+	clientMu sync.RWMutex
+	client   *sumdb.Client
 }
 
 // New creates a database client for base (e.g. https://sum.golang.org)
@@ -91,6 +99,26 @@ func New(base, key, stateDir string, client *http.Client, log *slog.Logger) (*DB
 	return db, nil
 }
 
+// clientSnapshot returns the current x/mod client. Callers must not hold the
+// read lock while using it.
+func (db *DB) clientSnapshot() *sumdb.Client {
+	db.clientMu.RLock()
+	defer db.clientMu.RUnlock()
+	return db.client
+}
+
+// discardClient replaces the client after a failed lookup. The in-memory
+// caches of the old client are dropped; persisted state under dir survives.
+// Only the goroutine that still sees the same client replaces it, so
+// concurrent failures do not churn through clients unnecessarily.
+func (db *DB) discardClient(old *sumdb.Client) {
+	db.clientMu.Lock()
+	defer db.clientMu.Unlock()
+	if db.client == old {
+		db.client = sumdb.NewClient(db)
+	}
+}
+
 // Name returns the checksum database name (e.g. "sum.golang.org"), the
 // prefix go clients use on the proxy's /sumdb/ endpoint.
 func (db *DB) Name() string { return db.name }
@@ -101,19 +129,24 @@ func (db *DB) Lookup(mod, ver string) (*Record, error) {
 	// The client filters a record's lines by "path version " prefix,
 	// so the zip hash and the go.mod hash need one lookup each.
 	// Both hit the same cached record, so the second is served from cache.
-	zipLines, err := db.client.Lookup(mod, ver)
+	client := db.clientSnapshot()
+	zipLines, err := client.Lookup(mod, ver)
 	if err != nil {
 		// The x/mod client wraps errors with %v, breaking errors.Is;
 		// the marker is only produced by our own ReadRemote for lookup
 		// 404s. Any other error (tile outage, bad signature, ...) fails
-		// closed via the caller.
+		// closed via the caller. Do not reset on ErrUnknown: private
+		// modules are expected to stay unverified without refetching
+		// their negative lookup on every request.
 		if strings.Contains(err.Error(), notFoundMarker) {
 			return nil, ErrUnknown
 		}
+		db.discardClient(client)
 		return nil, err
 	}
-	modLines, err := db.client.Lookup(mod, ver+"/go.mod")
+	modLines, err := client.Lookup(mod, ver+"/go.mod")
 	if err != nil {
+		db.discardClient(client)
 		return nil, err
 	}
 	lines := zipLines
@@ -214,7 +247,14 @@ func (db *DB) WriteConfig(file string, old, new []byte) error {
 	case !bytes.Equal(cur, old):
 		return sumdb.ErrWriteConflict
 	}
-	return writeFileAtomic(path, new)
+	if err := writeFileAtomic(path, new); err != nil {
+		return err
+	}
+	// Only configuration (the latest signed tree head) needs the extra
+	// directory sync; cache writes are validated after every read and are
+	// re-fetched when lost, so they stay cheap.
+	fsyncDir(filepath.Dir(path))
+	return nil
 }
 
 // ReadCache returns a cached lookup or tile, or an error if absent.
@@ -269,4 +309,15 @@ func writeFileAtomic(path string, data []byte) error {
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
+}
+
+// fsyncDir makes the rename durable. Losing the latest signed tree head
+// would weaken the transparency-log consistency check after a crash.
+func fsyncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer d.Close()
+	_ = d.Sync()
 }

@@ -76,7 +76,7 @@ type Proxy struct {
 	inflight singleflight.Group
 
 	negMu sync.Mutex
-	neg   map[string]int // upstream 404/410 negative cache, per request key
+	neg   map[string]negEntry // upstream 404/410 negative cache, per request key
 
 	sumdbProxy http.Handler
 }
@@ -105,7 +105,7 @@ func New(st *store.Store, db *sumdb.DB, m *stats.Stats, upstream string, verify 
 		verify:     verify,
 		client:     client,
 		log:        log,
-		neg:        make(map[string]int),
+		neg:        make(map[string]negEntry),
 		sumdbProxy: rp,
 	}, nil
 }
@@ -113,17 +113,35 @@ func New(st *store.Store, db *sumdb.DB, m *stats.Stats, upstream string, verify 
 // ServeSumDB forwards checksum database requests, so go clients can run
 // their own full verification through this proxy. The go protocol is
 // GET <proxy>/sumdb/<db>/<path>: the <path> is forwarded verbatim to the
-// configured database, so <db> must be its name.
+// configured database, so <db> must be its name. The name may contain a
+// slash (host/path), so match the whole name rather than one path element.
 func (p *Proxy) ServeSumDB(w http.ResponseWriter, r *http.Request) {
+	name := p.sumdb.Name()
 	rest, ok := strings.CutPrefix(r.URL.Path, "/sumdb/")
-	name, path, _ := strings.Cut(rest, "/")
-	if !ok || name != p.sumdb.Name() || path == "" {
+	prefix := name + "/"
+	if !ok || !strings.HasPrefix(rest, prefix) {
 		http.NotFound(w, r)
 		return
 	}
+	path := strings.TrimPrefix(strings.TrimPrefix(rest, prefix), "/")
+	if path == "" {
+		http.NotFound(w, r)
+		return
+	}
+	// The go client probes this endpoint before using the proxy for
+	// checksum-database traffic. Forwarding the probe upstream gets a
+	// 404, after which the client bypasses the proxy and connects to
+	// the database directly. Answer it locally.
+	if path == "supported" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	start := time.Now()
+	cw := &countingWriter{ResponseWriter: w}
 	r.URL.Path = "/" + path
 	r.URL.RawPath = ""
-	p.sumdbProxy.ServeHTTP(w, r)
+	p.sumdbProxy.ServeHTTP(cw, r)
+	p.stats.Pass(name, "sumdb", cw.n, time.Since(start))
 }
 
 // ServeModule handles a module protocol request. The path must be the
@@ -389,6 +407,12 @@ func (p *Proxy) fetchInfo(body io.Reader, mod, ver string) (*fetchResult, error)
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return nil, fmt.Errorf("proxy: %s@%s: invalid info json: %w", mod, ver, err)
 	}
+	// json.Unmarshal accepts null and objects without a Version, and a
+	// broken upstream could answer for another version. Cache only the
+	// metadata the protocol promises for this exact request.
+	if probe.Version != ver {
+		return nil, fmt.Errorf("proxy: %s@%s: info version mismatch %q", mod, ver, probe.Version)
+	}
 	f, err := p.store.PutBytes(mod, ver, store.KindInfo, data, "", false)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: %w", err)
@@ -474,15 +498,24 @@ func statusSummary(body io.Reader) string {
 	return strings.TrimSpace(string(data))
 }
 
+type negEntry struct {
+	code    int
+	expires time.Time
+}
+
 // negative returns the cached negative upstream status for a key, if fresh.
 func (p *Proxy) negative(mod, ver string, kind store.Kind) int {
 	p.negMu.Lock()
 	defer p.negMu.Unlock()
-	code, ok := p.neg[negKey(mod, ver, kind)]
+	entry, ok := p.neg[negKey(mod, ver, kind)]
 	if !ok {
 		return 0
 	}
-	return code
+	if !time.Now().Before(entry.expires) {
+		delete(p.neg, negKey(mod, ver, kind))
+		return 0
+	}
+	return entry.code
 }
 
 func (p *Proxy) setNegative(mod, ver string, kind store.Kind, code int) {
@@ -490,14 +523,9 @@ func (p *Proxy) setNegative(mod, ver string, kind store.Kind, code int) {
 	defer p.negMu.Unlock()
 	// ponytail: unbounded growth guard; a full reset just refetches.
 	if len(p.neg) > 10000 {
-		p.neg = make(map[string]int)
+		p.neg = make(map[string]negEntry)
 	}
-	p.neg[negKey(mod, ver, kind)] = code
-	time.AfterFunc(negTTL, func() {
-		p.negMu.Lock()
-		delete(p.neg, negKey(mod, ver, kind))
-		p.negMu.Unlock()
-	})
+	p.neg[negKey(mod, ver, kind)] = negEntry{code: code, expires: time.Now().Add(negTTL)}
 }
 
 func negKey(mod, ver string, kind store.Kind) string {
@@ -514,3 +542,25 @@ func (c *countingWriter) Write(b []byte) (int, error) {
 	c.n += int64(n)
 	return n, err
 }
+
+// ReadFrom preserves the underlying ResponseWriter's optimized copy path
+// (sendfile for *os.File bodies in net/http) while still accounting bytes.
+func (c *countingWriter) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := c.ResponseWriter.(io.ReaderFrom); ok {
+		n, err := rf.ReadFrom(r)
+		c.n += n
+		return n, err
+	}
+	n, err := io.Copy(struct{ io.Writer }{c}, r)
+	return n, err
+}
+
+// Flush and Unwrap keep optional ResponseWriter behavior available to
+// streaming handlers (the sumdb reverse proxy) behind the counter.
+func (c *countingWriter) Flush() {
+	if f, ok := c.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (c *countingWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
