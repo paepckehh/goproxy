@@ -358,9 +358,9 @@ func (d *DB) SaveClients(usage map[string]clients.Usage) error {
 	stmt, err := tx.Prepare(`INSERT INTO clients (id, requests, bytes_down, last_seen)
 		VALUES (?,?,?,?)
 		ON CONFLICT (id) DO UPDATE SET
-			requests = excluded.requests,
-			bytes_down = excluded.bytes_down,
-			last_seen = excluded.last_seen`)
+			requests = MAX(clients.requests, excluded.requests),
+			bytes_down = MAX(clients.bytes_down, excluded.bytes_down),
+			last_seen = MAX(clients.last_seen, excluded.last_seen)`)
 	if err != nil {
 		return fmt.Errorf("history: clients: %w", err)
 	}

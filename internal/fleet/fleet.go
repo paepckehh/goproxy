@@ -128,7 +128,9 @@ func (m *Monitor) Run(ctx context.Context) {
 }
 
 func (m *Monitor) probe(ctx context.Context, peer *url.URL) Status {
-	st := Status{URL: strings.TrimRight(peer.String(), "/"), CheckedAt: time.Now().UTC()}
+	// Redacted keeps credentials in the configured URL out of the
+	// dashboard payload and the journal.
+	st := Status{URL: strings.TrimRight(peer.Redacted(), "/"), CheckedAt: time.Now().UTC()}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, peer.JoinPath(healthPath).String(), nil)
 	if err != nil {
 		st.Err = err.Error()

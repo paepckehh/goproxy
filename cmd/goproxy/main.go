@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -161,6 +162,13 @@ func main() {
 	}()
 	go func() {
 		defer jobs.Done()
+		// Socket-activated on-demand mode exits after a short idle window,
+		// so a 100-module prewarm would spend upstream bandwidth on a
+		// process that is about to disappear. Prewarming belongs to the
+		// persistent deployment.
+		if exitOnIdle {
+			return
+		}
 		// Wait for the startup index scan: the ranking of the hottest
 		// modules comes from the cache index.
 		select {
@@ -242,9 +250,16 @@ func main() {
 		idleExit = watchIdle(ctx, track, idleGrace)
 	}
 
+	// Keep credentials embedded in a configured URL out of the journal and
+	// the dashboard: the wire request still uses the configured URL.
+	neighbourNames := make([]string, len(neighbours))
+	for i, raw := range neighbours {
+		neighbourNames[i] = redactURL(raw)
+	}
 	log.Info("listening", "addr", serveDesc, "socket-activated", socketActivated,
 		"exit-on-idle", exitOnIdle, "version", ver, "root", st.Root(), "stats-db", dbPath,
-		"upstream", *upstream, "neighbours", neighbours, "sumdb", *sumdbURL, "verify", *verify)
+		"upstream", redactURL(*upstream), "neighbours", neighbourNames,
+		"sumdb", redactURL(*sumdbURL), "verify", *verify)
 
 	exitCode := 0
 	select {
@@ -382,6 +397,16 @@ func envBool(name string) bool {
 	default:
 		return false
 	}
+}
+
+// redactURL hides a password embedded in a configured URL before it reaches
+// a log line. Invalid URLs are returned unchanged for the error path.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return raw
+	}
+	return u.Redacted()
 }
 
 // describeListeners renders what the server serves: systemd-passed

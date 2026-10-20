@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -102,4 +104,30 @@ func TestMonitor_NoPeers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	m.Run(ctx) // must return at once rather than blocking on a ticker
+}
+
+func TestMonitor_RedactsPeerCredentials(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok v1\n")
+	}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.UserPassword("builder", "s3cret")
+
+	m := New([]string{u.String()}, nil, testLogger())
+	m.Probe(context.Background())
+	got := m.Statuses()
+	if len(got) != 1 || !got[0].Online {
+		t.Fatalf("statuses = %+v, want one online peer", got)
+	}
+	if strings.Contains(got[0].URL, "s3cret") {
+		t.Errorf("status url %q leaks the peer password", got[0].URL)
+	}
+	if !strings.Contains(got[0].URL, "builder") {
+		t.Errorf("status url %q lost the peer identity", got[0].URL)
+	}
 }

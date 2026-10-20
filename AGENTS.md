@@ -69,7 +69,10 @@ forever), per-module access counters (requests/bytes served/last use,
 flushed every 30s so the cache table and top-modules bandwidth chart keep
 their totals across restarts), per-client counters (requests/bytes/last
 seen, keyed by X-Forwarded-For or socket address, bounded to 4096 entries
-in memory, flushed every 30s and pruned after 90d), and the event log
+in memory, flushed every 30s with monotonic MAX upserts so a counter reset
+from an evicted entry can never shrink the stored lifetime totals; the
+nightly window prunes rows older than 90d and caps the persisted table at
+the same 4096 busiest clients), and the event log
 (pruned after 90d). The
 dashboard is driven
 entirely by one Server-Sent Events stream (`/api/events?range=`): it seeds
@@ -152,23 +155,30 @@ request: lookups keep racing it and simply lose.
 
 Fleet sync: at startup (after the cache index scan, which supplies the
 ranking) and then once per hour with ±10 minutes jitter, the proxy resolves
-the latest version of the 100 most requested modules and fetches their
+the latest version of the 100 most requested modules (only modules that
+served at least one request; a cache with no traffic is never crawled) and
+fetches their
 `.info`, `.mod` and `.zip` through the normal fetch path
 (`internal/proxy/warm.go`). Neighbour caches are therefore asked first and
 one upstream copy serves the fleet. The pass logs one Info line, publishes
 one `prewarm` event and keeps a `fleet.WarmReport` (`Warmer.Report`:
-started, duration, next run, modules/fetched/failed/bytes and one
-`WarmItem` per module with resolved version, bytes, peer source and error)
+started, duration, next run, modules/fetched/failed/bytes/peer bytes and
+one `WarmItem` per module with resolved version, bytes, peer bytes, peer
+source and error)
 that the dashboard's pre-cache card renders. It is not a client request, so
 request/hit/miss counters stay untouched while its bandwidth still counts
-as upstream or peer bytes (`Stats.Prewarm`). The startup pass waits for the
-index scan so it does not run against an empty ranking.
+as upstream or peer bytes (`Stats.Prewarm`).
+The startup pass waits for the index scan so it does not run against an
+empty ranking. Socket-activated on-demand deployments (`EXIT_ON_IDLE=1`)
+skip the sync: the process exits after 30s idle, so a 100-module prewarm
+would spend upstream bandwidth on a process that is about to disappear.
 
 Checksum-database freshness: `sumdb.DB.RefreshLoop` refreshes the signed
 tree head from the database at startup and every 15 minutes. `Refresh`
 fetches `/latest`, verifies the note signature, refuses to roll the
-persisted head back, writes it through the x/mod compare-and-swap config
-path and replaces the in-memory client so the next lookup starts from the
+persisted head back (tree size), writes it through the x/mod
+compare-and-swap config path and replaces the in-memory client so the next
+lookup starts from the
 fresh timeline.
 
 Version queries: a request for `/<module>/@v/<query>.info` where the query
@@ -190,9 +200,10 @@ only (its name must match, others get 404), answers the go client's
 `/sumdb/<db>/supported` probe locally, and records forwarded traffic in the
 stats. Go clients can therefore run their full verification through the
 proxy. Shared singleflight fetches are detached from
-the requesting client's context: one disconnecting client cannot abort the
-download the other waiters share, and a completed download still warms the
-cache.
+the requesting client's context and bounded by a 30-minute fetch timeout:
+one disconnecting client cannot abort the
+download the other waiters share, a completed download still warms the
+cache, and a stalled upstream body cannot pin the fetch forever.
 
 ## Socket activation (env contract)
 

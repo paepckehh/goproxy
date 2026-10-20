@@ -334,7 +334,12 @@ func (s *Store) Modules() []ModStat {
 		}
 		out = append(out, ms)
 	}
-	slices.SortFunc(out, func(a, b ModStat) int { return cmp.Compare(b.Served, a.Served) })
+	slices.SortFunc(out, func(a, b ModStat) int {
+		if c := cmp.Compare(b.Served, a.Served); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Path, b.Path)
+	})
 	return out
 }
 
@@ -352,7 +357,9 @@ func (s *Store) TopServed(limit int) []ModStat {
 // TopRequests returns up to limit module aggregates ordered by served
 // requests, the ranking behind the dashboard's most-requested table and the
 // hourly cache sync. Ties fall back to bytes served, then to the path, for a
-// stable order. A negative limit returns every module.
+// stable order. Modules that never served a request are omitted, so the
+// ranking shows what the fleet actually serves and the sync never crawls a
+// never-requested cache. A negative limit returns every requested module.
 func (s *Store) TopRequests(limit int) []ModStat {
 	mods := s.Modules()
 	slices.SortStableFunc(mods, func(a, b ModStat) int {
@@ -364,6 +371,7 @@ func (s *Store) TopRequests(limit int) []ModStat {
 		}
 		return cmp.Compare(a.Path, b.Path)
 	})
+	mods = slices.DeleteFunc(mods, func(m ModStat) bool { return m.Requests <= 0 })
 	if limit >= 0 && len(mods) > limit {
 		mods = mods[:limit]
 	}

@@ -479,7 +479,7 @@ function drawTraffic(traffic) {
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
   const r = canvas.getBoundingClientRect();
-  if (canvas.width !== r.width * dpr) {
+  if (canvas.width !== r.width * dpr || canvas.height !== r.height * dpr) {
     canvas.width = r.width * dpr;
     canvas.height = r.height * dpr;
   }
@@ -560,7 +560,7 @@ function drawHistory(payload) {
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
   const r = canvas.getBoundingClientRect();
-  if (canvas.width !== r.width * dpr) {
+  if (canvas.width !== r.width * dpr || canvas.height !== r.height * dpr) {
     canvas.width = r.width * dpr;
     canvas.height = r.height * dpr;
   }
@@ -702,6 +702,7 @@ function renderPopular(list) {
   const rows = new Map();
   for (const tr of body.children) rows.set(tr.dataset.path, tr);
   const seen = new Set();
+  let i = 0;
   for (const m of state.popular) {
     seen.add(m.path);
     let tr = rows.get(m.path);
@@ -710,7 +711,7 @@ function renderPopular(list) {
       tr.dataset.path = m.path;
       tr.innerHTML = `<td><span class="path"></span></td><td class="r"></td>
         <td class="r"></td><td class="r"></td><td class="dim" data-time=""></td>`;
-      body.appendChild(tr);
+      rows.set(m.path, tr);
     }
     const cells = tr.children;
     cells[0].firstChild.textContent = m.path;
@@ -718,6 +719,9 @@ function renderPopular(list) {
     cells[2].textContent = fmtBytes(m.servedBytes);
     cells[3].textContent = fmtBytes(m.sizeBytes);
     cells[4].dataset.time = m.lastUsed && !m.lastUsed.startsWith("0001") ? m.lastUsed : "";
+    const at = body.children[i];
+    if (at !== tr) body.insertBefore(tr, at || null);
+    i++;
   }
   for (const [path, tr] of rows) {
     if (!seen.has(path)) tr.remove();
@@ -745,6 +749,7 @@ function renderClientTable(bodyId, emptyId, hintId, list, primary, hint) {
   const rows = new Map();
   for (const tr of body.children) rows.set(tr.dataset.id, tr);
   const seen = new Set();
+  let i = 0;
   for (const c of clients) {
     seen.add(c.id);
     let tr = rows.get(c.id);
@@ -753,7 +758,7 @@ function renderClientTable(bodyId, emptyId, hintId, list, primary, hint) {
       tr.dataset.id = c.id;
       tr.innerHTML = `<td><span class="path"></span></td><td class="r"></td>
         <td class="r"></td><td class="dim" data-time=""></td>`;
-      body.appendChild(tr);
+      rows.set(c.id, tr);
     }
     const cells = tr.children;
     cells[0].firstChild.textContent = c.id;
@@ -767,6 +772,9 @@ function renderClientTable(bodyId, emptyId, hintId, list, primary, hint) {
     const used = c.lastSeen && !c.lastSeen.startsWith("0001") ? c.lastSeen : "";
     cells[3].dataset.time = used;
     cells[3].textContent = used ? ago(used) : "never";
+    const at = body.children[i];
+    if (at !== tr) body.insertBefore(tr, at || null);
+    i++;
   }
   for (const [id, tr] of rows) {
     if (!seen.has(id)) tr.remove();
@@ -814,7 +822,11 @@ function prewarmItem(it) {
   ver.textContent = it.version || "—";
   const bytes = document.createElement("span");
   bytes.className = "pw-bytes";
-  bytes.textContent = it.bytes > 0 ? fmtBytes(it.bytes) : "already cached";
+  if (it.bytes > 0) {
+    bytes.textContent = fmtBytes(it.bytes);
+  } else {
+    bytes.textContent = it.error ? "—" : "already cached";
+  }
   const src = document.createElement("span");
   src.className = "pw-src dim";
   src.textContent = it.source ? "peer " + it.source : it.bytes > 0 ? "upstream" : "";

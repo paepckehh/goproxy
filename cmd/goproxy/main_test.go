@@ -135,3 +135,16 @@ func TestAccessLogKeepsFlusher(t *testing.T) {
 	}), log)
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/events", nil))
 }
+
+func TestRedactURL(t *testing.T) {
+	t.Parallel()
+	if got := redactURL("https://builder:s3cret@proxy.example:9090"); got != "https://builder:xxxxx@proxy.example:9090" {
+		t.Errorf("redactURL = %q, want the password masked", got)
+	}
+	if got := redactURL("https://proxy.example"); got != "https://proxy.example" {
+		t.Errorf("redactURL = %q, want a plain URL unchanged", got)
+	}
+	if got := redactURL("not a url"); got != "not a url" {
+		t.Errorf("redactURL = %q, want the invalid input unchanged", got)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -125,5 +126,108 @@ func TestWarmer_RunStopsOnCancellation(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not stop on context cancellation")
+	}
+}
+
+// TestWarmer_PeerBytesAreNotUpstreamBytes guards the bandwidth split: a
+// prewarm satisfied by a neighbour saves upstream traffic and must be
+// accounted as peer bytes, not as upstream usage.
+func TestWarmer_PeerBytesAreNotUpstreamBytes(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t, nil)
+	infoBytes := []byte(`{"Version":"` + testVer + `","Time":"2025-01-01T00:00:00Z"}`)
+	zipBytes := buildModuleZip(t, testMod, testVer)
+
+	var upstreamFiles atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + testMod + "/@latest":
+			fmt.Fprint(w, `{"Version":"`+testVer+`","Time":"2025-01-01T00:00:00Z"}`)
+		default:
+			upstreamFiles.Add(1)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	neighbour := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + testMod + "/@v/" + testVer + ".info":
+			w.Write(infoBytes)
+		case "/" + testMod + "/@v/" + testVer + ".zip":
+			w.Write(zipBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(neighbour.Close)
+
+	p, err := New(env.store, env.sumdbDB, env.stats, upstream.URL, []string{neighbour.URL}, false,
+		upstream.Client(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.store.PutBytes(testMod, testVer, store.KindMod, []byte("module "+testMod+"\n"), "", false); err != nil {
+		t.Fatal(err)
+	}
+	env.store.Get(testMod, testVer, store.KindMod).RecordHit(1)
+
+	w := NewWarmer(p, env.store.Popular, slog.New(slog.DiscardHandler))
+	sum := w.Sync(context.Background())
+	w.report(sum)
+	if sum.Failed != 0 || sum.Bytes <= 0 {
+		t.Fatalf("summary = %+v, want a successful peer-served pass", sum)
+	}
+	if got := upstreamFiles.Load(); got != 0 {
+		t.Errorf("upstream file requests = %d, want 0 (the neighbour had the files)", got)
+	}
+	snap := env.stats.Snapshot()
+	if snap.Lifetime.BytesUp != 0 {
+		t.Errorf("bytesUp = %d, want 0: peer bytes must not count as upstream", snap.Lifetime.BytesUp)
+	}
+	if snap.Lifetime.BytesNeighbour != sum.Bytes {
+		t.Errorf("bytesNeighbour = %d, want %d", snap.Lifetime.BytesNeighbour, sum.Bytes)
+	}
+}
+
+// TestWarmer_CountsBytesOfPartiallyFailedModules guards the report and the
+// bandwidth counters: a module whose zip download fails still pulled its
+// info from upstream, and that traffic must be accounted.
+func TestWarmer_CountsBytesOfPartiallyFailedModules(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t, nil)
+	infoBytes := []byte(`{"Version":"` + testVer + `","Time":"2025-01-01T00:00:00Z"}`)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + testMod + "/@latest":
+			fmt.Fprint(w, `{"Version":"`+testVer+`","Time":"2025-01-01T00:00:00Z"}`)
+		case "/" + testMod + "/@v/" + testVer + ".info":
+			w.Write(infoBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	p, err := New(env.store, env.sumdbDB, env.stats, upstream.URL, nil, false,
+		upstream.Client(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.store.PutBytes(testMod, testVer, store.KindMod, []byte("module "+testMod+"\n"), "", false); err != nil {
+		t.Fatal(err)
+	}
+	env.store.Get(testMod, testVer, store.KindMod).RecordHit(1)
+
+	w := NewWarmer(p, env.store.Popular, slog.New(slog.DiscardHandler))
+	sum := w.Sync(context.Background())
+	w.report(sum)
+	if sum.Failed != 1 {
+		t.Fatalf("summary = %+v, want one failed module", sum)
+	}
+	if sum.Bytes != int64(len(infoBytes)) {
+		t.Errorf("report bytes = %d, want the %d bytes pulled before the failure", sum.Bytes, len(infoBytes))
+	}
+	if got := env.stats.Snapshot().Lifetime.BytesUp; got != sum.Bytes {
+		t.Errorf("bytesUp = %d, want the partial pull %d", got, sum.Bytes)
 	}
 }

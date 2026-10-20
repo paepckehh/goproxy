@@ -25,7 +25,7 @@ deploy-test-nix: update build
 	sudo touch /nix/persist/root/bin/$(PROJECT) || true
 	sudo touch /nix/persist/root/bin/$(PROJECT).old || true
 	sudo cp -af /nix/persist/root/bin/$(PROJECT).old /nix/persist/root/bin/$(PROJECT).old2 || true 
-	sudo cp -af /nix/persist/root/bin/$(PROJECT)-pilot /nix/persist/root/bin/$(PROJECT).old || true 
+	sudo cp -af /nix/persist/root/bin/$(PROJECT) /nix/persist/root/bin/$(PROJECT).old || true 
 	sudo systemctl stop go-mod-proxy01.service || true
 	sudo systemctl stop go-mod-proxy02.service || true
 	sudo cp -af ./$(PROJECT) /nix/persist/root/bin/$(PROJECT)

@@ -158,8 +158,9 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 | `internal/version` | version injected via `-ldflags` |
 
 Shared singleflight fetches are detached from the requesting client's
-context: one disconnecting client cannot abort a download other waiters
-share, and a completed download still warms the cache.
+context and bounded by a 30-minute fetch timeout: one disconnecting client
+cannot abort a download other waiters share, a completed download still
+warms the cache, and a stalled upstream body cannot pin the fetch forever.
 
 ## Neighbour caches
 
@@ -186,7 +187,9 @@ requests: lookups keep racing it and simply lose.
 
 The fleet also stays warm on its own. At startup and then once per hour
 (jittered by ±10 minutes so proxies do not hit the upstream in lockstep)
-the proxy resolves the latest version of the 100 most requested modules and
+the proxy resolves the latest version of the 100 most requested modules
+(those that have actually served a request; a module the cache never served
+is not crawled) and
 fetches their `.info`, `.mod` and `.zip` through the regular path, so a
 neighbour that already has the content serves it and one upstream copy
 serves the whole fleet. The dashboard's **Pre-cache sync** card shows the
@@ -196,6 +199,9 @@ and one row per module with its resolved version, size, source (peer or
 upstream) and result. The pass is logged and published as a `prewarm`
 event; it is not a client request, so request/hit/miss counters stay clean
 while the bandwidth it spends is still counted as upstream or peer traffic.
+Socket-activated on-demand deployments skip the sync: their process exits
+after a short idle window, so a prewarm would spend bandwidth on a process
+that is about to disappear.
 
 ```sh
 NEIGHBOUR_CACHES=http://goproxy1:9090,http://goproxy2:9090 ./goproxy
@@ -301,7 +307,9 @@ without restarting or pausing serving:
 3. **Reorganize**: `VACUUM` rewrites the file without free pages and
    rebuilds every index, then `ANALYZE` and `PRAGMA optimize` refresh the
    planner statistics.
-4. **Client retention**: rows not seen for 90 days are deleted.
+4. **Client retention**: rows not seen for 90 days are deleted, and the
+   table is capped at the 4096 busiest clients so a stream of distinct
+   addresses cannot grow the stats database without limit.
 5. **Backup**: `VACUUM INTO` a consistent snapshot under a temporary
    name, verified read-only and immutable with `quick_check`, renamed into
    place, then compressed with gzip (0600). The uncompressed file is

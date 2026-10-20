@@ -3,6 +3,7 @@ package history
 import (
 	"compress/gzip"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"paepcke.de/goproxy/internal/clients"
 	"paepcke.de/goproxy/internal/stats"
 )
 
@@ -204,5 +206,31 @@ func TestHistory_NightlyCleansCrashLeftovers(t *testing.T) {
 	}
 	if _, err := os.Stat(fresh); err != nil {
 		t.Errorf("fresh temp file must survive: %v", err)
+	}
+}
+
+func TestHistory_NightlyCapsStoredClients(t *testing.T) {
+	t.Parallel()
+	db, _ := nightlyDB(t)
+	usage := make(map[string]clients.Usage, clients.MaxTracked+10)
+	for i := range clients.MaxTracked + 10 {
+		id := fmt.Sprintf("10.0.%d.%d", i/256, i%256)
+		usage[id] = clients.Usage{Requests: int64(i + 1), LastSeen: time.Now().UTC()}
+	}
+	if err := db.SaveClients(usage); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Nightly(context.Background(), time.Now(), "v1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.LoadClients(clients.MaxTracked * 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) > clients.MaxTracked {
+		t.Errorf("stored clients = %d, want at most %d", len(got), clients.MaxTracked)
+	}
+	if _, ok := got["10.0.16.9"]; !ok {
+		t.Error("the busiest client must survive the cap")
 	}
 }

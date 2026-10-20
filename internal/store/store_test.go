@@ -6,6 +6,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"sync"
 	"testing"
 )
@@ -331,7 +333,41 @@ func TestStore_PopularRanksByRequests(t *testing.T) {
 			t.Fatalf("Popular(2) = %v, want %v", got, want)
 		}
 	}
-	if all := s.Popular(10); len(all) != 3 {
-		t.Errorf("Popular(10) = %v, want all three modules", all)
+	// A module that never served a request must not be pre-warmed or shown
+	// as requested: the ranking exists to keep the hot set warm.
+	if all := s.Popular(10); len(all) != 2 {
+		t.Errorf("Popular(10) = %v, want only the requested modules", all)
 	}
+	if top := s.TopRequests(10); len(top) != 2 {
+		t.Errorf("TopRequests(10) = %v, want only the requested modules", top)
+	}
+}
+
+func TestStore_ModulesStableOrder(t *testing.T) {
+	t.Parallel()
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 20 {
+		mod := "example.com/m" + strconv.Itoa(i)
+		if _, err := s.PutBytes(mod, "v1.0.0", KindMod, []byte("module "+mod+"\n"), "", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := modPaths(s.Modules())
+	for range 20 {
+		got := modPaths(s.Modules())
+		if !slices.Equal(got, first) {
+			t.Fatalf("modules order changed between calls:\nfirst %v\nthen  %v", first, got)
+		}
+	}
+}
+
+func modPaths(mods []ModStat) []string {
+	out := make([]string, len(mods))
+	for i, m := range mods {
+		out[i] = m.Path
+	}
+	return out
 }

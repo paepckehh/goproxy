@@ -687,4 +687,21 @@ func TestHistory_ClientUsageRoundtrip(t *testing.T) {
 	if len(top) != 1 || top["10.0.0.2"].Requests != 9 {
 		t.Errorf("limited clients = %+v, want only the busiest", top)
 	}
+
+	// Counters are lifetime totals. A tracker can lose an evicted client's
+	// in-memory counter, and the next flush must never shrink the stored
+	// long-term values.
+	if err := db.SaveClients(map[string]clients.Usage{
+		"10.0.0.1": {Requests: 1, BytesDown: 1, LastSeen: time.Unix(1700000200, 0).UTC()},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = db.LoadClients(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := got["10.0.0.1"]; u.Requests != 5 || u.BytesDown != 3000 ||
+		!u.LastSeen.Equal(time.Unix(1700000200, 0)) {
+		t.Errorf("client 1 after a lower write = %+v, want totals preserved and last seen advanced", u)
+	}
 }

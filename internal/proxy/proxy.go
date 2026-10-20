@@ -41,6 +41,11 @@ const (
 	negTTL       = time.Minute
 	smallBodyMax = 4 << 20 // .info and .mod bodies must stay small
 
+	// fetchTimeout bounds one shared download. The fetch is detached from
+	// the requesting client's context, so without a deadline a stalled
+	// upstream body would hang the fetch (and every waiter) forever.
+	fetchTimeout = 30 * time.Minute
+
 	// neighbourHeaderTimeout bounds how long a neighbour cache may take to
 	// answer before the upstream fallback proceeds. It covers the response
 	// header only, so large zip bodies stream without a deadline.
@@ -62,12 +67,11 @@ func (e *verifyError) Error() string { return e.detail }
 
 // fetchResult is what a completed download looks like.
 type fetchResult struct {
-	file       *store.File
-	bytesUp    int64
-	verified   bool
-	unverified bool
-	fromCache  bool
-	neighbour  string // neighbour cache that served it; empty for upstream
+	file      *store.File
+	bytesUp   int64
+	verified  bool
+	fromCache bool
+	neighbour string // neighbour cache that served it; empty for upstream
 }
 
 // Proxy serves the module protocol against a cache and an upstream.
@@ -280,11 +284,14 @@ func (p *Proxy) serveVersioned(w http.ResponseWriter, r *http.Request, mod, ver 
 	key := mod + "@" + ver + ":" + string(kind)
 	// The shared download runs detached from this request's context: one
 	// client walking away must not abort the fetch every waiter shares,
-	// and a completed fetch still warms the cache.
+	// and a completed fetch still warms the cache. The timeout keeps a
+	// stalled upstream from pinning the fetch (and its waiters) forever.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), fetchTimeout)
+	defer cancel()
 	fetched := false
 	v, err, _ := p.inflight.Do(key, func() (any, error) {
 		fetched = true
-		return p.fetch(context.WithoutCancel(r.Context()), mod, ver, kind)
+		return p.fetch(ctx, mod, ver, kind)
 	})
 	if err != nil {
 		p.serveFetchError(w, err, mod, ver, kind, start)
@@ -453,7 +460,11 @@ func neighbourClient(base *http.Client) *http.Client {
 	case *http.Transport:
 		tr = t
 	case nil:
-		tr = http.DefaultTransport.(*http.Transport)
+		def, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			return &c
+		}
+		tr = def
 	default:
 		return &c // custom round tripper: reuse as-is
 	}

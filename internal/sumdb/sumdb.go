@@ -183,6 +183,11 @@ func (db *DB) Lookup(mod, ver string) (*Record, error) {
 // transparency log instead of only learning about new entries while it
 // happens to verify a module. The x/mod client keeps the head in memory, so
 // the client is replaced after the persisted head advances.
+//
+// ponytail: the signature is verified and the tree never shrinks, but the
+// new head is not proven consistent with the previous root. Add a
+// tlog.CheckTree consistency proof if a split-view log is in the threat
+// model.
 func (db *DB) Refresh(ctx context.Context) error {
 	u := *db.base
 	u.Path = db.base.Path + "/latest"

@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"paepcke.de/goproxy/internal/clients"
 )
 
 const (
@@ -160,6 +162,19 @@ func (d *DB) Nightly(ctx context.Context, now time.Time, version string) (Report
 		return rep, fmt.Errorf("history: nightly prune clients: %w", err)
 	}
 	rep.Pruned, _ = res.RowsAffected()
+	// The in-memory table is bounded, and startup only restores the busiest
+	// MaxTracked clients. Keep the persisted table equally bounded so a
+	// stream of distinct addresses cannot grow the stats database without
+	// limit within the retention window.
+	res, err = d.db.ExecContext(ctx, `DELETE FROM clients WHERE id NOT IN (
+		SELECT id FROM clients ORDER BY requests DESC, last_seen DESC LIMIT ?)`,
+		clients.MaxTracked)
+	if err != nil {
+		return rep, fmt.Errorf("history: nightly cap clients: %w", err)
+	}
+	if capped, err := res.RowsAffected(); err == nil {
+		rep.Pruned += capped
+	}
 
 	archive, size, kept, err := d.backup(ctx, now, version)
 	if err != nil {
@@ -302,12 +317,11 @@ func (d *DB) backup(ctx context.Context, now time.Time, version string) (string,
 		return "", 0, 0, err
 	}
 	archive := snapshot
-	if err := compressGzip(snapshot); err != nil {
-		// Keep the uncompressed snapshot: the backup exists, just larger.
-		archive = snapshot
-	} else {
+	if err := compressGzip(snapshot); err == nil {
 		archive = snapshot + ".gz"
 	}
+	// On a compression failure the uncompressed snapshot is kept: the
+	// backup exists, just larger.
 	fi, err := os.Stat(archive)
 	if err != nil {
 		return "", 0, 0, err

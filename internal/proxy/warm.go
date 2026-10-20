@@ -147,20 +147,24 @@ feed:
 	wg.Wait()
 
 	var fetched, failed atomic.Int64
-	var bytes atomic.Int64
+	var bytes, peerBytes atomic.Int64
 	for _, it := range items[:attempted] {
+		// Bytes pulled before a later kind failed are real traffic and
+		// must reach the counters; only the module's success is affected.
+		bytes.Add(it.Bytes)
+		peerBytes.Add(it.PeerBytes)
 		if it.Err != "" {
 			failed.Add(1)
 			continue
 		}
 		if it.Bytes > 0 {
 			fetched.Add(1)
-			bytes.Add(it.Bytes)
 		}
 	}
 	report.Modules = attempted
 	report.Fetched = int(fetched.Load())
 	report.Bytes = bytes.Load()
+	report.PeerBytes = peerBytes.Load()
 	report.Failed = int(failed.Load())
 	report.Items = items[:attempted]
 	report.DurationMS = time.Since(start).Milliseconds()
@@ -192,6 +196,7 @@ func (w *Warmer) warmModule(ctx context.Context, mod string) fleet.WarmItem {
 		item.Bytes += res.bytesUp
 		if res.neighbour != "" {
 			item.Source = res.neighbour
+			item.PeerBytes += res.bytesUp
 		}
 	}
 	return item
@@ -203,7 +208,7 @@ func (w *Warmer) report(r fleet.WarmReport) {
 	}
 	w.log.Info("prewarm: fleet cache sync",
 		"modules", r.Modules, "fetched", r.Fetched, "bytes", r.Bytes, "failed", r.Failed)
-	w.p.stats.Prewarm(r.Modules, r.Fetched, r.Failed, r.Bytes)
+	w.p.stats.Prewarm(r.Modules, r.Fetched, r.Failed, r.Bytes-r.PeerBytes, r.PeerBytes)
 }
 
 // next returns the next interval with symmetric jitter applied.
