@@ -226,14 +226,15 @@ const AGENDA_MAX = 8;
 
 // Color by rank, not by rotation depth, so the fixed side agenda always
 // matches the bars.
-function barColor(i, n) {
-  const t = n <= 1 ? 0.5 : i / (n - 1);
-  const hue = 250 + (190 - 250) * t;
+const BAR_HUES = [252, 199, 160, 43, 350, 285, 18, 187];
+
+function barColor(i) {
+  const hue = BAR_HUES[i % BAR_HUES.length];
   return {
-    top: `hsl(${hue} 85% 62%)`,
-    front: `hsl(${hue} 70% 44% / 0.92)`,
-    side: `hsl(${hue} 65% 32% / 0.92)`,
-    swatch: `hsl(${hue} 85% 58%)`,
+    top: `hsl(${hue} 90% 64%)`,
+    front: `hsl(${hue} 72% 46% / 0.94)`,
+    side: `hsl(${hue} 68% 34% / 0.94)`,
+    swatch: `hsl(${hue} 90% 60%)`,
   };
 }
 
@@ -245,6 +246,7 @@ const chart3d = {
   key: "",
   w: 0,
   h: 0,
+  highlight: -1,
 
   init() {
     this.canvas = $("chart3d");
@@ -260,6 +262,14 @@ const chart3d = {
     };
     new ResizeObserver(fit).observe(this.canvas);
     fit();
+    const agenda = $("chart3d-agenda");
+    if (agenda) {
+      agenda.addEventListener("mouseover", (e) => {
+        const li = e.target.closest("li");
+        this.highlight = li ? Number(li.dataset.rank) : -1;
+      });
+      agenda.addEventListener("mouseleave", () => { this.highlight = -1; });
+    }
     const loop = () => {
       // Rotate only while the tab is visible; redraw once when it returns.
       if (!document.hidden) this.rot += 0.0042;
@@ -287,9 +297,10 @@ const chart3d = {
     const X = x * c - z * s;
     const Z = x * s + z * c;
     const w = this.w, h = this.h;
-    const fov = 700;
-    const scale = fov / (fov + Z + 260);
-    return { x: w / 2 + X * scale, y: h * 0.78 - y * scale, scale, z: Z };
+    // Clamp the depth scale so wide stages still fill their width instead
+    // of collapsing the bars into a small center cluster.
+    const scale = Math.min(1.02, Math.max(0.74, 900 / (900 + Z + 320)));
+    return { x: w / 2 + X * scale, y: h * 0.88 - y * scale, scale, z: Z };
   },
 
   draw() {
@@ -307,17 +318,20 @@ const chart3d = {
     }
 
     const maxV = Math.max(...this.data.map((d) => d.value), 1);
-    const spacing = 62;
-    const bw = 34;
-    const maxH = h * 0.55;
+    // Fill the stage: spacing and bar width grow with the canvas, so wide
+    // dashboards get wide bars instead of a small centered cluster.
+    const spacing = n <= 1 ? 0 : Math.min(w * 0.34, (w * 0.9) / (n - 1));
+    const bw = Math.min(64, Math.max(18, spacing * 0.42));
+    const maxH = h * 0.74;
+    const depth = n * spacing * 0.6 + 40;
 
     // Floor grid.
     ctx.strokeStyle = "rgba(148, 163, 255, 0.10)";
     ctx.lineWidth = 1;
-    for (const gx of [-4, -2, 0, 2, 4]) {
+    for (const gx of [-0.42, -0.21, 0, 0.21, 0.42]) {
       ctx.beginPath();
-      const a = this.project(gx * spacing / 2, 0, -n * spacing / 2 - 30);
-      const b = this.project(gx * spacing / 2, 0, n * spacing / 2 + 30);
+      const a = this.project(gx * w, 0, -depth);
+      const b = this.project(gx * w, 0, depth);
       ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     }
 
@@ -329,7 +343,7 @@ const chart3d = {
     bars.sort((a, b) => a.depth - b.depth);
 
     bars.forEach((b) => {
-      const { top, front, side } = barColor(b.i, n);
+      const { top, front, side } = barColor(b.i);
 
       const c = [
         this.project(b.x - bw / 2, 0, -bw / 2), this.project(b.x + bw / 2, 0, -bw / 2),
@@ -357,27 +371,33 @@ const chart3d = {
       ctx.lineTo(c[6].x, c[6].y); ctx.lineTo(c[7].x, c[7].y);
       ctx.closePath(); ctx.fill();
 
-      // Rank and value above the bar; the name lives in the fixed agenda.
-      const labelY = this.project(b.x, b.height + 16, 0);
-      ctx.fillStyle = "#e6ecf7";
-      ctx.font = "600 11px ui-monospace, monospace";
-      ctx.textAlign = "center";
-      ctx.fillText((b.i + 1) + " · " + fmtBytes(b.value), labelY.x, labelY.y);
+      // Hovering an agenda row outlines its bar, so the shared color alone
+      // carries the link between the 3D scene and the names.
+      if (this.highlight === b.i) {
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(c[4].x, c[4].y); ctx.lineTo(c[5].x, c[5].y);
+        ctx.lineTo(c[6].x, c[6].y); ctx.lineTo(c[7].x, c[7].y);
+        ctx.closePath();
+        ctx.moveTo(c[1].x, c[1].y); ctx.lineTo(c[5].x, c[5].y);
+        ctx.moveTo(c[2].x, c[2].y); ctx.lineTo(c[6].x, c[6].y);
+        ctx.stroke();
+      }
     });
   },
 };
 
 // Non-rotating agenda beside the 3D scene: module names stay readable
-// while it turns. The rank and swatch match the bar index.
+// while it turns. Each row's color chip is its index and matches its bar.
 function renderAgenda(data) {
   const ul = $("chart3d-agenda");
   if (!ul) return;
   ul.innerHTML = data.map((d, i) => {
-    const color = barColor(i, data.length);
-    return `<li>
-      <span class="ag-swatch" style="background:${color.swatch};color:${color.swatch}"></span>
-      <span class="ag-rank">${i + 1}</span>
-      <span class="ag-name" title="${escapeHTML(d.full)}">${escapeHTML(d.label)}</span>
+    const color = barColor(i);
+    return `<li data-rank="${i}" title="${escapeHTML(d.full)}">
+      <span class="ag-swatch" style="--swatch:${color.swatch}"></span>
+      <span class="ag-name">${escapeHTML(d.label)}</span>
       <span class="ag-val">${fmtBytes(d.value)}</span>
     </li>`;
   }).join("");
