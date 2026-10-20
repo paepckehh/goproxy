@@ -2,7 +2,6 @@ package stats
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -136,13 +135,12 @@ func TestStats_TrafficBuckets(t *testing.T) {
 	}
 }
 
-// fakeRecorder captures recorder calls for inspection.
+// fakeRecorder captures queued batches for inspection.
 type fakeRecorder struct {
 	mu      sync.Mutex
 	buckets []Bucket
 	totals  []Totals
 	events  []Event
-	fail    bool
 }
 
 func (f *fakeRecorder) snapshot() (buckets []Bucket, totals []Totals, events []Event) {
@@ -151,34 +149,15 @@ func (f *fakeRecorder) snapshot() (buckets []Bucket, totals []Totals, events []E
 	return f.buckets, f.totals, f.events
 }
 
-func (f *fakeRecorder) SaveTotals(t Totals) error {
+func (f *fakeRecorder) QueueBatch(b Batch) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.fail {
-		return errors.New("boom")
+	if b.Totals != nil {
+		f.totals = append(f.totals, *b.Totals)
 	}
-	f.totals = append(f.totals, t)
-	return nil
-}
-
-func (f *fakeRecorder) RecordBucket(b Bucket) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.fail {
-		return errors.New("boom")
-	}
-	f.buckets = append(f.buckets, b)
-	return nil
-}
-
-func (f *fakeRecorder) AppendEvents(evs []Event) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.fail {
-		return errors.New("boom")
-	}
-	f.events = append(f.events, evs...)
-	return nil
+	f.buckets = append(f.buckets, b.Buckets...)
+	f.events = append(f.events, b.Events...)
+	return 0
 }
 
 func TestStats_RecorderFlush(t *testing.T) {
@@ -263,25 +242,26 @@ func TestStats_EventFieldsAreBounded(t *testing.T) {
 	}
 }
 
-func TestStats_RecorderErrorsCountedNotFatal(t *testing.T) {
+func TestStats_PersistErrorsCountedNotFatal(t *testing.T) {
 	t.Parallel()
-	rec := &fakeRecorder{fail: true}
-	s := fastCollector(rec)
+	s := fastCollector(&fakeRecorder{})
 	s.Hit("m", "v1.0.0", "zip", 10, time.Millisecond)
 	stop := run(t, s)
+	s.RecordPersistError()
 	waitFor(t, func() bool { return s.Snapshot().PersistErrors > 0 })
 	stop()
 
 	snap := s.Snapshot()
 	if snap.Lifetime.Hits != 1 {
-		t.Errorf("hits = %d, want 1 (recorder errors must not affect counting)", snap.Lifetime.Hits)
+		t.Errorf("hits = %d, want 1 (persist errors must not affect counting)", snap.Lifetime.Hits)
 	}
 }
 
 func TestStats_PendingBacklogCapped(t *testing.T) {
 	t.Parallel()
-	// A recorder that fails forever: the retry backlog must stop growing.
-	s := New(&fakeRecorder{fail: true})
+	// The collector's in-memory retry backlog must stop growing between
+	// flushes instead of becoming an unbounded memory sink.
+	s := New(&fakeRecorder{})
 	for range pendingMax + 100 {
 		s.append(Event{Result: "hit"})
 	}

@@ -203,14 +203,14 @@ func main() {
 	usageDone := make(chan struct{})
 	go func() {
 		defer close(usageDone)
-		tick := time.NewTicker(moduleFlushInterval)
+		tick := time.NewTicker(persistInterval)
 		defer tick.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				persistUsage(hist, st, tracker, log)
+				persistStats(hist, st, tracker, m, log)
 			}
 		}
 	}()
@@ -290,10 +290,11 @@ func main() {
 	<-statsDone
 	<-histDone
 	<-usageDone
-	// Final module and client usage snapshot before the database closes, so
-	// a restart resumes the served-bandwidth totals where they left off.
-	persistUsage(hist, st, tracker, log)
+	// Final lazy flush before the database closes, so a restart resumes
+	// every dashboard counter where it left off.
+	persistStats(hist, st, tracker, m, log)
 	if err := hist.Close(); err != nil {
+		m.RecordPersistError()
 		log.Error("closing stats database", "err", err)
 		exitCode = 1
 	}
@@ -305,10 +306,11 @@ func main() {
 	}
 }
 
-// moduleFlushInterval bounds how much per-module and per-client access
-// accounting a crash can lose; both are always written once more on
-// shutdown.
-const moduleFlushInterval = 30 * time.Second
+// persistInterval is how often the process bundles every buffered dashboard
+// counter (lifetime totals, minute buckets, events, module and client usage)
+// into one lazy database transaction. The stats collector itself only writes
+// to memory; shutdown always takes one final large flush.
+const persistInterval = 15 * time.Minute
 
 // clientLoadLimit bounds how many persisted clients are restored into the
 // in-memory ranking at startup.
@@ -318,14 +320,16 @@ const clientLoadLimit = clients.MaxTracked
 // so verification never starts from a stale transparency-log view.
 const sumdbRefreshInterval = 15 * time.Minute
 
-// persistUsage writes the modules and clients that saw traffic since the
-// last flush, so the dashboard rankings survive restarts.
-func persistUsage(hist *history.DB, st *store.Store, tracker *clients.Tracker, log *slog.Logger) {
-	if err := hist.SaveModuleUsage(st.TakeUsage()); err != nil {
-		log.Warn("persisting module usage", "err", err)
-	}
-	if err := hist.SaveClients(tracker.TakeDirty()); err != nil {
-		log.Warn("persisting client usage", "err", err)
+// persistStats queues the module and client counters that saw traffic since
+// the last pass and writes every buffered counter in one transaction, so the
+// dashboard rankings and KPI totals survive restarts. A failed write keeps
+// the buffer for the next attempt and surfaces on the dashboard.
+func persistStats(hist *history.DB, st *store.Store, tracker *clients.Tracker, m *stats.Stats, log *slog.Logger) {
+	hist.QueueModuleUsage(st.TakeUsage())
+	hist.QueueClients(tracker.TakeDirty())
+	if err := hist.Flush(); err != nil {
+		m.RecordPersistError()
+		log.Warn("persisting stats", "err", err)
 	}
 }
 

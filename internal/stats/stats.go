@@ -2,7 +2,8 @@
 // ring, per-second traffic buckets, and long-term persistence through a
 // Recorder (the cgo-free SQLite backend in internal/history). The hot path
 // only touches atomics and a buffered channel, so recording never blocks a
-// request; the collector goroutine flushes to the recorder in batches.
+// request; the collector buffers batches in memory and the process writes
+// them all in one lazy transaction at most every 15 minutes and on shutdown.
 package stats
 
 import (
@@ -80,17 +81,23 @@ type Bucket struct {
 	Store StoreStat `json:"store"`
 }
 
-// Recorder persists stats data outside the request path. Implementations
-// must be safe for concurrent use. Errors are counted and surfaced on the
-// dashboard (persistErrors); a failing recorder never degrades proxying.
+// Batch is one memory-buffered persistence batch: the latest lifetime
+// totals (nil when only buckets or events are sent), the minute buckets
+// recorded since the previous batch and the pending events. The recorder
+// writes it lazily in a single transaction.
+type Batch struct {
+	Totals  *Totals
+	Buckets []Bucket
+	Events  []Event
+}
+
+// Recorder buffers stats data for a lazy database write. Implementations
+// must be safe for concurrent use and must not block on I/O: QueueBatch only
+// copies into memory and returns the number of events dropped because the
+// buffered backlog is full. A failing flush is counted and surfaced on the
+// dashboard (persistErrors) and never degrades proxying.
 type Recorder interface {
-	// SaveTotals upserts the lifetime counters.
-	SaveTotals(Totals) error
-	// RecordBucket upserts one minute of activity: deltas merge, store
-	// snapshots overwrite.
-	RecordBucket(Bucket) error
-	// AppendEvents appends a batch of events atomically.
-	AppendEvents([]Event) error
+	QueueBatch(Batch) int
 }
 
 // Snapshot is the dashboard-facing state.
@@ -132,7 +139,7 @@ type Stats struct {
 	evCh      chan Event
 	evMu      sync.Mutex
 	events    []Event
-	pending   []Event // events awaiting the next recorder flush; Run goroutine only
+	pending   []Event // events awaiting the next recorder batch; Run goroutine only
 	subMu     sync.Mutex
 	subs      map[chan Event]struct{}
 	tMu       sync.Mutex
@@ -170,8 +177,10 @@ func WithTickInterval(d time.Duration) Option {
 	}
 }
 
-// WithFlushInterval overrides the recorder flush interval. Non-positive
-// intervals keep the default (time.NewTicker panics on them).
+// WithFlushInterval overrides the interval at which the collector hands its
+// in-memory batch to the recorder. Non-positive intervals keep the default
+// (time.NewTicker panics on them). It does not change the database write
+// cadence, which the process-level flush loop owns.
 func WithFlushInterval(d time.Duration) Option {
 	return func(s *Stats) {
 		if d > 0 {
@@ -191,9 +200,9 @@ func WithStartedAt(t time.Time) Option {
 	}
 }
 
-// New creates a collector. rec persists lifetime totals, one history
-// bucket per minute and the event log; nil disables persistence (counters
-// and the feed stay in memory only).
+// New creates a collector. rec buffers the lifetime totals, the history
+// buckets and the event log for the process-level lazy flush; nil disables
+// persistence (counters and the feed stay in memory only).
 func New(rec Recorder, opts ...Option) *Stats {
 	s := &Stats{
 		started:       time.Now().UTC(),
@@ -346,10 +355,9 @@ func (s *Stats) publish(ev Event) {
 	}
 }
 
-// flush persists the bucket delta since the last flush, the lifetime
-// totals and the pending events. Only the Run goroutine calls it, so the
-// pending slice needs no lock. On recorder errors the delta baseline and
-// the pending batch are kept, so failed writes are retried next flush.
+// flush hands the pending batch to the recorder. The recorder only buffers
+// it in memory; the database is written lazily by the process-level flush
+// loop. Only the Run goroutine calls it, so the pending slice needs no lock.
 func (s *Stats) flush() {
 	if s.rec == nil {
 		return
@@ -357,29 +365,26 @@ func (s *Stats) flush() {
 	t := s.totals()
 	s.flushMu.Lock()
 	delta := subtract(t, s.lastFlush)
+	s.lastFlush = t
 	s.flushMu.Unlock()
 	var st StoreStat
 	if s.storeSampler != nil {
 		st = s.storeSampler()
 	}
-	if err := s.rec.RecordBucket(Bucket{Bucket: time.Now().UTC(), Totals: delta, Store: st}); err != nil {
-		s.dbErrs.Add(1)
-	} else {
-		s.flushMu.Lock()
-		s.lastFlush = t
-		s.flushMu.Unlock()
+	batch := Batch{
+		Totals:  &t,
+		Buckets: []Bucket{{Bucket: time.Now().UTC(), Totals: delta, Store: st}},
+		Events:  s.pending,
 	}
-	if err := s.rec.SaveTotals(t); err != nil {
-		s.dbErrs.Add(1)
+	if dropped := s.rec.QueueBatch(batch); dropped > 0 {
+		s.dropped.Add(int64(dropped))
 	}
-	if len(s.pending) == 0 {
-		return
-	}
-	if err := s.rec.AppendEvents(s.pending); err != nil {
-		s.dbErrs.Add(1)
-	} else {
-		s.pending = s.pending[:0]
-	}
+	s.pending = s.pending[:0]
+}
+
+// RecordPersistError notes a failed lazy database flush for the dashboard.
+func (s *Stats) RecordPersistError() {
+	s.dbErrs.Add(1)
 }
 
 // Hit records a cache hit serving the given byte count.

@@ -36,9 +36,10 @@ cmd/goproxy          entrypoint: flags, env wiring, socket activation, idle exit
 internal/store       disk cache (standard download/ layout) + in-memory index
 internal/sumdb       checksum-database verification (x/mod sumdb client)
 internal/stats       lock-free counters, event ring, traffic buckets, process
-                     memory sampling, recorder flush loop
-internal/history     long-term stats in SQLite (pure-Go driver, WAL, minute
-                     buckets, clients table, nightly check/compaction/backup)
+                     memory sampling, lazy recorder batches
+internal/history     long-term stats in SQLite (pure-Go driver, WAL, 64 KiB
+                     pages, 15-minute bundled flush, minute buckets, clients
+                     table, nightly check/compaction/backup)
 internal/clients     bounded in-memory per-client request/bandwidth ranking
 internal/proxy       GOPROXY protocol handlers (singleflight, neighbour-first
                      fetch, verify, cache; fetches detached from client contexts);
@@ -71,15 +72,18 @@ stats persist in the stats database (SQLite, WAL) in the default state dir
 `StateDirectory`), else `<root>/stats.db` for unprivileged local runs:
 lifetime totals table, one
 bucket per minute (requests/hits/misses/bytes + store-size snapshots, kept
-forever), per-module access counters (requests/bytes served/last use,
-flushed every 30s so the cache table and top-modules bandwidth chart keep
-their totals across restarts), per-client counters (requests/bytes/last
+forever), per-module access counters (requests/bytes served/last use),
+per-client counters (requests/bytes/last
 seen, keyed by X-Forwarded-For or socket address, bounded to 4096 entries
-in memory, flushed every 30s with monotonic MAX upserts so a counter reset
+in memory, monotonic MAX upserts so a counter reset
 from an evicted entry can never shrink the stored lifetime totals; the
 nightly window prunes rows older than 90d and caps the persisted table at
 the same 4096 busiest clients), and the event log
-(pruned after 90d). The
+(pruned after 90d). All of those dashboard counters are buffered in memory
+and written together in one very large lazy transaction at most every
+15 minutes and once on shutdown: 64 KiB pages, `synchronous=OFF`, no
+automatic checkpoints, no fsync/force on the counter path. A crash loses
+at most the unflushed window. The
 dashboard is driven
 entirely by one Server-Sent Events stream (`/api/events?range=`): it seeds
 the event ring, counters, cache table, most-requested list, client
@@ -104,8 +108,9 @@ The same reconciliation keeps both client rankings and the most-requested
 table in server order. Deep links (`#clients`, `#history`, ...) use one
 animation-frame scroll after the pushed state settles, not a refresh timer.
 The request hot path never
-touches the DB: atomics + buffered channel, batched flush every 30s plus a
-final flush+WAL checkpoint on shutdown; recorder errors surface as warning
+touches the DB: atomics + buffered channel, one bundled lazy transaction at
+most every 15 minutes plus a final flush and WAL checkpoint on shutdown;
+recorder errors surface as warning
 pills in the dashboard header (`persistErrors`, dropped events) and never
 degrade proxying. Legacy pre-SQLite
 `stats.json` snapshots migrate into `stats.db` on first start (renamed to
@@ -126,8 +131,8 @@ complete and the WAL empty; results are logged and pushed as a
 `maintenance` event. A start after a missed window catches up once after
 five minutes. The single SQLite connection serializes the window with the
 recorder. The dashboard reads the client rankings and the history series
-from memory (client table + 20s series cache); only the flush loop and the
-nightly window touch the database. The process memory card samples
+from memory (client table + 20s series cache); only the 15-minute lazy flush
+and the nightly window touch the database. The process memory card samples
 `/proc/self/status` RSS, Go heap and goroutines at most once per second and
 shows the cgroup `MemoryMax` ceiling systemd installed.
 

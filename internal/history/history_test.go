@@ -489,6 +489,25 @@ func TestHistory_CollectorPersistsAcrossRestart(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { s.Run(ctx); close(done) }()
+	// The proxy flushes the lazy buffer every 15 minutes; the test runs the
+	// same flush loop fast so the collector batches land on disk.
+	flushDone := make(chan struct{})
+	go func() {
+		defer close(flushDone)
+		tick := time.NewTicker(10 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if err := db.Flush(); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}
+	}()
 
 	// Wait for the first flush cycle, so Run has taken its delta baseline.
 	deadline := time.Now().Add(2 * time.Second)
@@ -511,6 +530,7 @@ func TestHistory_CollectorPersistsAcrossRestart(t *testing.T) {
 	}
 	cancel()
 	<-done
+	<-flushDone
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -543,6 +563,82 @@ func TestHistory_CollectorPersistsAcrossRestart(t *testing.T) {
 	if len(evs) != 2 || evs[0].Result != "miss" {
 		t.Errorf("persisted events = %+v, want newest-first miss then hit", evs)
 	}
+}
+
+// TestHistory_QueueIsLazy pins the persistence contract: queued counters,
+// buckets, events, modules and clients only reach SQLite when the process
+// flushes, and one flush writes them all.
+func TestHistory_QueueIsLazy(t *testing.T) {
+	t.Parallel()
+	db := open(t)
+	minute := time.Now().UTC().Truncate(time.Minute)
+	totals := stats.Totals{Requests: 3, Hits: 2, BytesSaved: 100}
+	db.QueueBatch(stats.Batch{
+		Totals:  &totals,
+		Buckets: []stats.Bucket{{Bucket: minute, Totals: totals, Store: stats.StoreStat{Bytes: 42}}},
+		Events:  []stats.Event{{Time: minute, Result: "hit", Module: "m"}},
+	})
+	db.QueueModuleUsage(map[string]store.ModuleUsage{
+		"m": {Requests: 2, Served: 100, LastUsed: minute},
+	})
+	db.QueueClients(map[string]clients.Usage{
+		"10.0.0.1": {Requests: 2, BytesDown: 100, LastSeen: minute},
+	})
+
+	if got, err := db.LoadTotals(); err != nil || got != (stats.Totals{}) {
+		t.Errorf("totals before flush = %+v, %v; want empty", got, err)
+	}
+	if from, to, err := db.Bounds(); err != nil || !from.IsZero() || !to.IsZero() {
+		t.Errorf("bounds before flush = %v..%v, %v; want empty", from, to, err)
+	}
+	if evs, err := db.RecentEvents(10); err != nil || len(evs) != 0 {
+		t.Errorf("events before flush = %+v, %v; want none", evs, err)
+	}
+	if usage, err := db.LoadModuleUsage(); err != nil || len(usage) != 0 {
+		t.Errorf("modules before flush = %+v, %v; want none", usage, err)
+	}
+	if usage, err := db.LoadClients(10); err != nil || len(usage) != 0 {
+		t.Errorf("clients before flush = %+v, %v; want none", usage, err)
+	}
+
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.LoadTotals(); err != nil || got != totals {
+		t.Errorf("totals after flush = %+v, %v; want %+v", got, err, totals)
+	}
+	if pts, err := db.Series(minute.Add(-time.Minute), minute.Add(time.Minute), time.Minute); err != nil || len(pts) != 1 || pts[0].Hits != 2 {
+		t.Errorf("buckets after flush = %+v, %v", pts, err)
+	}
+	if evs, err := db.RecentEvents(10); err != nil || len(evs) != 1 || evs[0].Module != "m" {
+		t.Errorf("events after flush = %+v, %v", evs, err)
+	}
+	if usage, err := db.LoadModuleUsage(); err != nil || usage["m"].Requests != 2 {
+		t.Errorf("modules after flush = %+v, %v", usage, err)
+	}
+	if usage, err := db.LoadClients(10); err != nil || usage["10.0.0.1"].Requests != 2 {
+		t.Errorf("clients after flush = %+v, %v", usage, err)
+	}
+}
+
+// TestHistory_LazyDatabasePragmas pins the deliberately lazy write policy:
+// maximum page size, no synchronous durability and no automatic checkpoint.
+func TestHistory_LazyDatabasePragmas(t *testing.T) {
+	t.Parallel()
+	db := open(t)
+	check := func(pragma string, want int) {
+		t.Helper()
+		var got int
+		if err := db.db.QueryRow(`PRAGMA ` + pragma).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("%s = %d, want %d", pragma, got, want)
+		}
+	}
+	check("page_size", 65536)
+	check("synchronous", 0) // OFF
+	check("wal_autocheckpoint", 0)
 }
 
 func mustRecent(t *testing.T, db *DB, n int) []stats.Event {

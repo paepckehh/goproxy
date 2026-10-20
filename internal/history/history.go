@@ -1,13 +1,15 @@
 // Package history stores long-term proxy statistics in SQLite. The driver
 // is pure Go (modernc.org/sqlite), so the single binary stays cgo-free.
 //
-// The database holds three tables: lifetime totals, one bucket per
-// wall-clock minute of activity (with cache-store size snapshots), and the
-// rolling event log. The stats collector writes in batches off the request
-// path; the dashboard reads aggregated series. Everything survives
-// reboots: lifetime counters, the full minute-resolution history (kept
-// forever, about half a million rows per year), and the recent event feed
-// (bounded by eventRetention).
+// The database holds lifetime totals, one bucket per wall-clock minute of
+// activity (with cache-store size snapshots), per-module and per-client
+// usage, and the rolling event log. The stats collector queues batches in
+// memory; the process writes everything in one large transaction at most
+// every 15 minutes and once on shutdown, with 64 KiB pages, synchronous=OFF
+// and no automatic checkpoints, so a counter flush never fsyncs or forces.
+// Everything survives reboots: lifetime counters, the full minute-resolution
+// history (kept forever, about half a million rows per year), and the recent
+// event feed (bounded by eventRetention).
 package history
 
 import (
@@ -35,6 +37,15 @@ const (
 	eventRetention = 90 * 24 * time.Hour
 	pruneInterval  = 24 * time.Hour
 	recentEvents   = 512
+
+	// maxQueuedEvents bounds the lazy write backlog. A flush runs several
+	// times per hour, so this only matters when a database write keeps
+	// failing; the collector then drops (and counts) new events instead of
+	// growing memory without limit.
+	maxQueuedEvents = 1 << 16
+	// maxQueuedBuckets is far above one flush window; it only guards
+	// against a wedged flush loop.
+	maxQueuedBuckets = 1 << 12
 )
 
 // DB is the long-term stats database. All methods are safe for concurrent
@@ -46,20 +57,52 @@ type DB struct {
 	pruneInterval time.Duration
 
 	// mu serializes the nightly maintenance window (Lock) with every
-	// recorder write and dashboard read (RLock): VACUUM and the snapshot
+	// database write and dashboard read (RLock): VACUUM and the snapshot
 	// never race a flush, and no write is lost to a busy database.
 	mu sync.RWMutex
+
+	// pendingMu guards the lazy write buffer. Queue methods only touch
+	// memory, so the stats collector never blocks on database I/O.
+	pendingMu sync.Mutex
+	pending   pendingWrites
 }
 
-// Open creates or opens the database at path with WAL journaling.
+// pendingWrites is everything accumulated for the next large transaction:
+// lifetime totals, minute buckets, events, per-module and per-client usage.
+type pendingWrites struct {
+	totals    stats.Totals
+	hasTotals bool
+	buckets   []stats.Bucket
+	events    []stats.Event
+	modules   map[string]store.ModuleUsage
+	clients   map[string]clients.Usage
+}
+
+func (p *pendingWrites) empty() bool {
+	return !p.hasTotals && len(p.buckets) == 0 && len(p.events) == 0 &&
+		len(p.modules) == 0 && len(p.clients) == 0
+}
+
+// Open creates or opens the database at path. Writes are deliberately lazy:
+// 64 KiB pages, a large page cache, WAL journaling with synchronous=OFF and
+// automatic checkpoints disabled. A stats flush therefore lands as one large
+// transaction without fsync/force; checkpoints happen at the nightly window
+// and at shutdown. Databases created before the large-page switch keep their
+// current page size until the nightly VACUUM rewrites them.
 func Open(path string) (*DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("history: %w", err)
 	}
+	// The driver applies _pragma values before the shorthand keys, and
+	// sorts _pragma values: page_size therefore lands before WAL (which
+	// materializes page 1) and still configures a fresh database.
 	dsn := "file:" + filepath.ToSlash(path) +
 		"?_pragma=busy_timeout(10000)" +
-		"&_pragma=journal_mode(WAL)" +
-		"&_pragma=synchronous(NORMAL)"
+		"&_pragma=page_size(65536)" +
+		"&_pragma=cache_size(-32768)" +
+		"&_pragma=wal_autocheckpoint(0)" +
+		"&_journal_mode=WAL" +
+		"&_synchronous=OFF"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("history: %w", err)
@@ -197,12 +240,156 @@ func ensureColumns(db *sql.DB, table string, cols []struct{ name, decl string })
 	return nil
 }
 
-// Close checkpoints the WAL and closes the database.
+// Close flushes the lazy write buffer, checkpoints the WAL and closes the
+// database. The shutdown flush is the one place that writes everything still
+// buffered, so a clean stop loses at most the time since the last periodic
+// flush.
 func (d *DB) Close() error {
+	flushErr := d.Flush()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	_, _ = d.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`) // best effort
-	return d.db.Close()
+	closeErr := d.db.Close()
+	if flushErr != nil {
+		return flushErr
+	}
+	return closeErr
+}
+
+// QueueBatch buffers one collector batch for the next lazy Flush. It only
+// touches memory and returns how many events were dropped because the backlog
+// was full.
+func (d *DB) QueueBatch(b stats.Batch) int {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	if b.Totals != nil {
+		d.pending.totals = *b.Totals
+		d.pending.hasTotals = true
+	}
+	for _, bucket := range b.Buckets {
+		if len(d.pending.buckets) >= maxQueuedBuckets {
+			break
+		}
+		d.pending.buckets = append(d.pending.buckets, bucket)
+	}
+	room := maxQueuedEvents - len(d.pending.events)
+	if room < 0 {
+		room = 0
+	}
+	dropped := 0
+	if len(b.Events) > room {
+		dropped = len(b.Events) - room
+		b.Events = b.Events[:room]
+	}
+	d.pending.events = append(d.pending.events, b.Events...)
+	return dropped
+}
+
+// QueueModuleUsage buffers per-module access counters for the next Flush.
+// Absolute values are written, so the latest snapshot wins.
+func (d *DB) QueueModuleUsage(usage map[string]store.ModuleUsage) {
+	if len(usage) == 0 {
+		return
+	}
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	if d.pending.modules == nil {
+		d.pending.modules = make(map[string]store.ModuleUsage, len(usage))
+	}
+	for path, u := range usage {
+		d.pending.modules[path] = u
+	}
+}
+
+// QueueClients buffers per-client access counters for the next Flush.
+// Absolute values are written, so a restart restores the long-term ranking.
+func (d *DB) QueueClients(usage map[string]clients.Usage) {
+	if len(usage) == 0 {
+		return
+	}
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	if d.pending.clients == nil {
+		d.pending.clients = make(map[string]clients.Usage, len(usage))
+	}
+	for id, u := range usage {
+		d.pending.clients[id] = u
+	}
+}
+
+// SaveTotals queues the lifetime counters and flushes immediately. The
+// proxy itself never calls it: the periodic persist loop batches it with
+// every other counter.
+func (d *DB) SaveTotals(t stats.Totals) error {
+	d.QueueBatch(stats.Batch{Totals: &t})
+	return d.Flush()
+}
+
+// RecordBucket queues one minute of activity and flushes immediately.
+func (d *DB) RecordBucket(b stats.Bucket) error {
+	d.QueueBatch(stats.Batch{Buckets: []stats.Bucket{b}})
+	return d.Flush()
+}
+
+// AppendEvents queues a batch of events and flushes immediately.
+func (d *DB) AppendEvents(evs []stats.Event) error {
+	d.QueueBatch(stats.Batch{Events: evs})
+	return d.Flush()
+}
+
+// SaveModuleUsage queues per-module access counters and flushes immediately.
+func (d *DB) SaveModuleUsage(usage map[string]store.ModuleUsage) error {
+	d.QueueModuleUsage(usage)
+	return d.Flush()
+}
+
+// SaveClients queues per-client access counters and flushes immediately.
+func (d *DB) SaveClients(usage map[string]clients.Usage) error {
+	d.QueueClients(usage)
+	return d.Flush()
+}
+
+// Flush writes every buffered counter, bucket, event, module and client in
+// one transaction. The buffer is kept on failure, so the next flush retries
+// the same data without duplicating or losing it. Values that were queued
+// again meanwhile simply overwrite the older absolute snapshots.
+func (d *DB) Flush() error {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	if d.pending.empty() {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("history: flush: %w", err)
+	}
+	defer tx.Rollback()
+	if d.pending.hasTotals {
+		if err := saveTotalsTx(tx, d.pending.totals); err != nil {
+			return err
+		}
+	}
+	for _, bucket := range d.pending.buckets {
+		if err := recordBucketTx(tx, bucket); err != nil {
+			return err
+		}
+	}
+	if err := appendEventsTx(tx, d.pending.events); err != nil {
+		return err
+	}
+	if err := saveModuleUsageTx(tx, d.pending.modules); err != nil {
+		return err
+	}
+	if err := saveClientsTx(tx, d.pending.clients); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("history: flush: %w", err)
+	}
+	d.pending = pendingWrites{}
+	return nil
 }
 
 // Run prunes the event log periodically until ctx is done. Prune failures
@@ -227,13 +414,6 @@ func (d *DB) prune(now time.Time) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	_, _ = d.db.Exec(`DELETE FROM events WHERE time < ?`, now.Add(-eventRetention).Unix())
-}
-
-// SaveTotals upserts the lifetime counters (stats.Recorder).
-func (d *DB) SaveTotals(t stats.Totals) error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return saveTotalsTx(d.db, t)
 }
 
 // saveTotalsTx upserts the lifetime counters on an open transaction.
@@ -275,20 +455,13 @@ func (d *DB) LoadTotals() (stats.Totals, error) {
 	return t, nil
 }
 
-// SaveModuleUsage upserts per-module access counters. Absolute values are
-// written, so a later restart restores the lifetime served bandwidth the
-// dashboard's top-modules chart shows.
-func (d *DB) SaveModuleUsage(usage map[string]store.ModuleUsage) error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+// saveModuleUsageTx upserts per-module access counters on an open
+// transaction. Absolute values are written, so a later restart restores the
+// lifetime served bandwidth the dashboard's top-modules chart shows.
+func saveModuleUsageTx(tx *sql.Tx, usage map[string]store.ModuleUsage) error {
 	if len(usage) == 0 {
 		return nil
 	}
-	tx, err := d.db.Begin()
-	if err != nil {
-		return fmt.Errorf("history: module usage: %w", err)
-	}
-	defer tx.Rollback()
 	stmt, err := tx.Prepare(`INSERT INTO module_usage (path, requests, served_bytes, last_used)
 		VALUES (?,?,?,?)
 		ON CONFLICT (path) DO UPDATE SET
@@ -307,9 +480,6 @@ func (d *DB) SaveModuleUsage(usage map[string]store.ModuleUsage) error {
 		if _, err := stmt.Exec(path, u.Requests, u.Served, lastUsed); err != nil {
 			return fmt.Errorf("history: module usage: %w", err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("history: module usage: %w", err)
 	}
 	return nil
 }
@@ -342,19 +512,13 @@ func (d *DB) LoadModuleUsage() (map[string]store.ModuleUsage, error) {
 	return usage, nil
 }
 
-// SaveClients upserts per-client access counters. Absolute values are
-// written, so a restart restores the long-term client ranking.
-func (d *DB) SaveClients(usage map[string]clients.Usage) error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+// saveClientsTx upserts per-client access counters on an open transaction.
+// Absolute values are written (monotonic MAX), so a restart restores the
+// long-term client ranking.
+func saveClientsTx(tx *sql.Tx, usage map[string]clients.Usage) error {
 	if len(usage) == 0 {
 		return nil
 	}
-	tx, err := d.db.Begin()
-	if err != nil {
-		return fmt.Errorf("history: clients: %w", err)
-	}
-	defer tx.Rollback()
 	stmt, err := tx.Prepare(`INSERT INTO clients (id, requests, bytes_down, last_seen)
 		VALUES (?,?,?,?)
 		ON CONFLICT (id) DO UPDATE SET
@@ -373,9 +537,6 @@ func (d *DB) SaveClients(usage map[string]clients.Usage) error {
 		if _, err := stmt.Exec(id, u.Requests, u.BytesDown, lastSeen); err != nil {
 			return fmt.Errorf("history: clients: %w", err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("history: clients: %w", err)
 	}
 	return nil
 }
@@ -410,14 +571,12 @@ func (d *DB) LoadClients(limit int) (map[string]clients.Usage, error) {
 	return usage, nil
 }
 
-// RecordBucket upserts one minute of activity (stats.Recorder): counter
-// deltas merge when several flushes land in the same minute, store size
-// snapshots overwrite (last sample wins).
-func (d *DB) RecordBucket(b stats.Bucket) error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+// recordBucketTx upserts one minute of activity on an open transaction:
+// counter deltas merge when several flushes land in the same minute, store
+// size snapshots overwrite (last sample wins).
+func recordBucketTx(tx *sql.Tx, b stats.Bucket) error {
 	key := b.Bucket.Truncate(time.Minute).Unix()
-	_, err := d.db.Exec(`INSERT INTO buckets (
+	_, err := tx.Exec(`INSERT INTO buckets (
 			bucket, requests, hits, misses, passes,
 			verifications, verify_failures,
 			bytes_down, bytes_up, bytes_saved,
@@ -452,31 +611,13 @@ func (d *DB) RecordBucket(b stats.Bucket) error {
 	return nil
 }
 
-// AppendEvents inserts a batch of events in one transaction: either every
-// event of the batch lands, or none does, so failed batches can be retried
-// without duplicates.
-func (d *DB) AppendEvents(evs []stats.Event) error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+// appendEventsTx inserts a batch of events on an open transaction: either
+// every event of the batch lands, or none does, so failed batches can be
+// retried without duplicates.
+func appendEventsTx(tx *sql.Tx, evs []stats.Event) error {
 	if len(evs) == 0 {
 		return nil
 	}
-	tx, err := d.db.Begin()
-	if err != nil {
-		return fmt.Errorf("history: events: %w", err)
-	}
-	defer tx.Rollback()
-	if err := appendEventsTx(tx, evs); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("history: events: %w", err)
-	}
-	return nil
-}
-
-// appendEventsTx inserts a batch of events on an open transaction.
-func appendEventsTx(tx *sql.Tx, evs []stats.Event) error {
 	stmt, err := tx.Prepare(`INSERT INTO events (
 			time, result, module, version, kind, status, bytes, dur_ms, detail
 		) VALUES (?,?,?,?,?,?,?,?,?)`)
