@@ -1,10 +1,10 @@
-{config, ...}: {
+{ config, ... }: {
   ##################
   #-=# SERVICES #=-#
   ##################
   services.caddy = {
     enable = true;
-    virtualHosts."goproxy".extraConfig = ''proxy 127.0.0.1:9090'';
+    virtualHosts."goproxy".extraConfig = "proxy 127.0.0.1:9090";
   };
 
   #################
@@ -12,15 +12,15 @@
   #################
   systemd.services.go-mod-proxy = {
     description = "goproxy caching Go module proxy";
-    wantedBy = ["multi-user.target"];
-    wants = ["network-online.target"];
-    after = ["network-online.target"];
-    startLimitIntervalSec = 0;
-    environment.BIND_ADDR = "127.0.0.1:9090";
-    # module storage on the dedicated cache disk; the long-term stats
-    # database stays in the default state dir (/var/lib/goproxy) via
-    # StateDirectory below
-    environment.CACHE_ROOT = "/nix/persist/cache/go/proxy";
+    wantedBy = [ "multi-user.target" ];
+    wants = [ "network-online.target" ];
+    after = [ "network-online.target" ];
+    startLimitIntervalSec = 30;
+    startLimitBurst = 3;
+    environment = {
+      BIND_ADDR = "127.0.0.1:9090";
+      CACHE_ROOT = "/nix/persist/cache/go/proxy";
+    };
     serviceConfig = {
       ExecStart = "/nix/persist/root/bin/goproxy";
       StateDirectory = "goproxy";
@@ -34,7 +34,10 @@
       LimitNOFILE = 16384;
       NoNewPrivileges = true;
       ProtectSystem = "strict";
-      ReadWritePaths = ["/var/lib/goproxy" "/nix/persist/cache/go/proxy"];
+      ReadWritePaths = [
+        "/var/lib/goproxy"
+        "/nix/persist/cache/go/proxy"
+      ];
       ProtectHome = true;
       PrivateTmp = true;
       PrivateDevices = true;
@@ -62,11 +65,18 @@
         "~@timer"
       ];
       CapabilityBoundingSet = "";
-      RestrictAddressFamilies = ["AF_INET" "AF_INET6" "AF_UNIX"];
+      RestrictAddressFamilies = [
+        "AF_INET"
+        "AF_INET6"
+        "AF_UNIX"
+      ];
       SocketBindDeny = "any";
       SocketBindAllow = "tcp:9090";
-      IPAddressDeny = ["any"];
-      IPAddressAllow = ["127.0.0.0/8" "::1"];
+      IPAddressDeny = [ "any" ];
+      IPAddressAllow = [
+        "127.0.0.0/8"
+        "::1"
+      ];
     };
   };
 }

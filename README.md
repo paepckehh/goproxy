@@ -209,7 +209,10 @@ listening socket never goes away, so clients (and the caddy vhost, which
 must target the socket address) always get served; stats are flushed and
 the database checkpointed on every idle exit. Use `Restart = on-failure`
 for the service: idle exits are successful, and `Restart = always` would
-loop with `EXIT_ON_IDLE`.
+loop with `EXIT_ON_IDLE`. A bounded start rate limit
+(`startLimitBurst = 3` per `startLimitIntervalSec = 30`) stops crash
+loops: after three failed starts in 30 seconds the unit enters `failed`
+instead of restarting forever.
 
 ### NixOS
 
@@ -240,7 +243,8 @@ services.go-mod-proxy = {
   pinned to the one listen port (outbound `connect()`/DNS untouched),
   memory 512M cap, full kernel/proc/namespace/keyring isolation; egress
   is unrestricted by design, fetching from upstream is the job
-- **availability**: `Restart = always` with no start-rate-limit,
+- **availability**: `Restart = always` with a bounded start rate limit
+  (3 starts per 30s, then the unit enters `failed` instead of looping),
   `network-online` ordering, bounded 15s stop matching the binary's 10s
   graceful-shutdown window
 

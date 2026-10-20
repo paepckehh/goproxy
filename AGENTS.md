@@ -72,7 +72,10 @@ no descriptors were actually passed). `EXIT_ON_IDLE=1` (socket-activated
 mode only) exits cleanly once no request has been in flight for 30s — with
 the final stats flush and WAL checkpoint — since systemd re-arms the socket
 and restarts on demand. Combine it with `Restart=on-failure`, never
-`Restart=always` (idle exit is success and would loop otherwise).
+`Restart=always` (idle exit is success and would loop otherwise). Both
+bundled units bound crash loops with `startLimitBurst = 3` within
+`startLimitIntervalSec = 30`: repeated failed starts leave the unit
+`failed` instead of restarting forever.
 
 ## Stats database and cache location
 
@@ -110,7 +113,9 @@ never aspirational.
 `services.go-mod-proxy.{enable,bin,host,port,root}`. It deliberately runs a
 PERSISTENT server (`wantedBy = multi-user.target`, `Restart = always`,
 network-online ordering), NOT socket activation: fleet toolchains must find
-the proxy alive at any build time. Defaults: binary
+the proxy alive at any build time. Restarts are rate-limited (3 starts per
+30s): a crashing binary ends in `failed` within seconds instead of
+looping. Defaults: binary
 `/nix/persist/root/bin/goproxy` (make build, manual deploy), cache root
 `/nix/persist/cache/go/proxy`. Hardened: strict read-only FS plus
 ReadWritePaths on the cache root, seccomp `@system-service` minus
