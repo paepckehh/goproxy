@@ -30,7 +30,6 @@ import (
 	"time"
 
 	"golang.org/x/mod/module"
-	"golang.org/x/mod/semver"
 	"golang.org/x/sync/singleflight"
 
 	"paepcke.de/goproxy/internal/stats"
@@ -228,12 +227,42 @@ func (p *Proxy) ServeModule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ver, err := module.UnescapeVersion(verEsc)
-	if err != nil || !semver.IsValid(ver) {
+	if err != nil {
 		p.badRequest(w, modPath, "invalid version "+verEsc)
+		return
+	}
+	// A canonical version (v1.2.3, a pseudo-version, +incompatible) is
+	// immutable and cacheable. Anything else is a version query: branches,
+	// short tags like v1.2, commit hashes. The go command asks for those as
+	// <module>/@v/<query>.info and reads the canonical version from the
+	// answer, so only the upstream can resolve them and the answer moves.
+	if ver == "" || module.CanonicalVersion(ver) != ver {
+		if store.Kind(kind) != store.KindInfo || !validQuery(ver) {
+			p.badRequest(w, modPath, "invalid version "+verEsc)
+			return
+		}
+		p.passThrough(w, r, mod, "@v/"+verEsc+".info", start)
 		return
 	}
 
 	p.serveVersioned(w, r, modPath, ver, store.Kind(kind), start)
+}
+
+// validQuery reports whether a non-canonical version query (branch name,
+// short tag, commit hash) can be forwarded as one upstream path element.
+// module.EscapeVersion already rejects slashes and dot segments, so a query
+// can never climb out of the module's @v/ directory; this guards the raw
+// characters a hand-written request could still smuggle in.
+func validQuery(q string) bool {
+	if q == "" || q == "." || q == ".." {
+		return false
+	}
+	for _, r := range q {
+		if r <= ' ' || r == 0x7f || r == '/' || r == '\\' || r == '%' || r == '?' || r == '#' {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Proxy) badRequest(w http.ResponseWriter, mod, detail string) {

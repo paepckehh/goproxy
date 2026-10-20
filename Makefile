@@ -29,8 +29,8 @@ deploy-test-nix: update build
 	sudo systemctl stop go-mod-proxy01.service || true
 	sudo systemctl stop go-mod-proxy02.service || true
 	sudo cp -af ./$(PROJECT) /nix/persist/root/bin/$(PROJECT)
-	sudo systemctl start go-mod-proxy02.service
-	sudo systemctl start go-mod-proxy01.service
+	sudo systemctl start go-mod-proxy02.service || true
+	sudo systemctl start go-mod-proxy01.service || true
 
 deps:
 	rm -rf go.mod go.sum

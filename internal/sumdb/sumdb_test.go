@@ -3,6 +3,7 @@ package sumdb
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
 	"io/fs"
@@ -347,4 +348,106 @@ func TestDB_HTTPTimeoutApplied(t *testing.T) {
 	if _, err := db.ReadRemote("/lookup/x@v1"); err == nil {
 		t.Error("expected timeout error")
 	}
+}
+
+func TestDB_RefreshPersistsVerifiedTreeHead(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t, func(path, ver string) ([]byte, error) {
+		return recordLines(path, ver), nil
+	})
+	if _, err := db.Lookup("example.com/m", "v1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	head, err := db.ReadConfig(db.name + "/latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := treeSize(head, note.VerifierList(db.verifier)); got < 1 {
+		t.Fatalf("persisted tree size = %d, want a signed head", got)
+	}
+	// A refresh at the same tree is a no-op and must keep working.
+	if err := db.Refresh(context.Background()); err != nil {
+		t.Fatalf("second refresh: %v", err)
+	}
+	// Verification still works through the replaced client.
+	if _, err := db.Lookup("example.com/m", "v1.0.0"); err != nil {
+		t.Fatalf("lookup after refresh: %v", err)
+	}
+}
+
+func TestDB_RefreshRejectsBadSignature(t *testing.T) {
+	t.Parallel()
+	skey, vkey, err := note.GenerateKey(rand.Reader, "test.sumdb.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := sumdb.NewServer(sumdb.NewTestServer(skey, func(path, ver string) ([]byte, error) {
+		return recordLines(path, ver), nil
+	}))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/latest" {
+			// A syntactically valid note signed by another key.
+			w.Write([]byte("go.sum database tree\n1\n\n— test.sumdb.example AAAA\n"))
+			return
+		}
+		base.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	db, err := New(srv.URL, vkey, t.TempDir(), srv.Client(), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Refresh(context.Background()); err == nil {
+		t.Fatal("refresh accepted a tree head with an invalid signature")
+	}
+}
+
+func TestDB_RefreshLoopStopsOnCancellation(t *testing.T) {
+	t.Parallel()
+	var latest atomic.Int64
+	skey, vkey, err := note.GenerateKey(rand.Reader, "test.sumdb.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := sumdb.NewServer(sumdb.NewTestServer(skey, func(path, ver string) ([]byte, error) {
+		return recordLines(path, ver), nil
+	}))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/latest" {
+			latest.Add(1)
+		}
+		base.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	db, err := New(srv.URL, vkey, t.TempDir(), srv.Client(), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		db.RefreshLoop(ctx, 5*time.Millisecond)
+	}()
+	waitForAtomic(t, &latest)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RefreshLoop did not stop on context cancellation")
+	}
+}
+
+func waitForAtomic(t *testing.T, n *atomic.Int64) {
+	t.Helper()
+	for range 500 {
+		if n.Load() > 0 {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("condition not reached in time")
 }

@@ -15,9 +15,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"paepcke.de/goproxy/internal/fleet"
 	"paepcke.de/goproxy/internal/history"
 	"paepcke.de/goproxy/internal/proxy"
 	"paepcke.de/goproxy/internal/stats"
@@ -98,7 +100,10 @@ func main() {
 		log.Error("startup", "err", err)
 		os.Exit(1)
 	}
-	uiH := ui.New(m, st, hist, ver)
+	// The neighbour fleet is probed at startup and then every 10 minutes,
+	// so the dashboard shows which peers are currently reachable.
+	peers := fleet.New(neighbours, moduleClient(), log)
+	uiH := ui.New(m, st, hist, ver, peers)
 
 	// Socket activation: serve on the sockets systemd passed (LISTEN_FDS)
 	// when present; otherwise bind the resolved address. EXIT_ON_IDLE is
@@ -127,7 +132,33 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Background maintenance: neighbour health, checksum-database freshness
+	// and the hourly fleet cache sync. All of it stops with ctx.
+	indexed := make(chan struct{})
+	var jobs sync.WaitGroup
+	jobs.Add(3)
 	go func() {
+		defer jobs.Done()
+		peers.Run(ctx)
+	}()
+	go func() {
+		defer jobs.Done()
+		db.RefreshLoop(ctx, sumdbRefreshInterval)
+	}()
+	go func() {
+		defer jobs.Done()
+		// Wait for the startup index scan: the ranking of the hottest
+		// modules comes from the cache index.
+		select {
+		case <-ctx.Done():
+			return
+		case <-indexed:
+		}
+		proxy.NewWarmer(p, st.Popular, log).Run(ctx)
+	}()
+
+	go func() {
+		defer close(indexed)
 		start := time.Now()
 		n, err := st.Scan(ctx)
 		if err != nil {
@@ -220,6 +251,10 @@ func main() {
 		exitCode = 1
 	}
 	stop()
+	// Let the background jobs observe the cancellation before the stats
+	// collector takes its final snapshot, so prewarmed bandwidth is
+	// included in the last bucket.
+	jobs.Wait()
 	// Wait for the collector to flush its final bucket, then close the
 	// stats database cleanly.
 	<-statsDone
@@ -243,6 +278,10 @@ func main() {
 // moduleFlushInterval bounds how much per-module access accounting a crash
 // can lose; the counters are always written once more on shutdown.
 const moduleFlushInterval = 30 * time.Second
+
+// sumdbRefreshInterval keeps the signed checksum-database tree head fresh,
+// so verification never starts from a stale transparency-log view.
+const sumdbRefreshInterval = 15 * time.Minute
 
 // persistModuleUsage writes the modules that saw traffic since the last
 // flush, so the dashboard's served-bandwidth ranking survives restarts.

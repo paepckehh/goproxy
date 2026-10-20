@@ -305,3 +305,33 @@ func TestStore_ConcurrentAccess(t *testing.T) {
 		t.Error("concurrent writes lost the file")
 	}
 }
+
+func TestStore_PopularRanksByRequests(t *testing.T) {
+	t.Parallel()
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mods := []string{"example.com/cold", "example.com/hot", "example.com/warm"}
+	for _, mod := range mods {
+		if _, err := s.PutBytes(mod, "v1.0.0", KindMod, []byte("module "+mod+"\n"), "", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Get("example.com/hot", "v1.0.0", KindMod).RecordHit(10)
+	s.Get("example.com/warm", "v1.0.0", KindMod).RecordHit(2)
+
+	got := s.Popular(2)
+	want := []string{"example.com/hot", "example.com/warm"}
+	if len(got) != len(want) {
+		t.Fatalf("Popular(2) = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Popular(2) = %v, want %v", got, want)
+		}
+	}
+	if all := s.Popular(10); len(all) != 3 {
+		t.Errorf("Popular(10) = %v, want all three modules", all)
+	}
+}

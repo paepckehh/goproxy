@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"paepcke.de/goproxy/internal/fleet"
 	"paepcke.de/goproxy/internal/history"
 	"paepcke.de/goproxy/internal/stats"
 	"paepcke.de/goproxy/internal/store"
@@ -44,18 +45,27 @@ var historyRanges = map[string]historyRange{
 // dashboardPayload is the one-shot dashboard state for scripts and
 // health probes; the dashboard page itself only consumes the SSE stream.
 type dashboardPayload struct {
-	Version string          `json:"version"`
-	Stats   stats.Snapshot  `json:"stats"`
-	Store   store.Summary   `json:"store"`
-	Modules []store.ModStat `json:"modules"`
+	Version    string          `json:"version"`
+	Stats      stats.Snapshot  `json:"stats"`
+	Store      store.Summary   `json:"store"`
+	Modules    []store.ModStat `json:"modules"`
+	Neighbours []fleet.Status  `json:"neighbours"`
 }
 
 // statePayload is the cache half of a live dashboard push: the store
-// summary, the module table and the running version.
+// summary, the module table, the neighbour fleet status and the running
+// version.
 type statePayload struct {
-	Version string          `json:"version"`
-	Store   store.Summary   `json:"store"`
-	Modules []store.ModStat `json:"modules"`
+	Version    string          `json:"version"`
+	Store      store.Summary   `json:"store"`
+	Modules    []store.ModStat `json:"modules"`
+	Neighbours []fleet.Status  `json:"neighbours"`
+}
+
+// PeerSource reports the health of the configured neighbour caches. A nil
+// source (standalone proxy) reports none.
+type PeerSource interface {
+	Statuses() []fleet.Status
 }
 
 // historyPayload is one aggregated long-term series.
@@ -75,11 +85,21 @@ type Handler struct {
 	store   *store.Store
 	hist    *history.DB
 	version string
+	peers   PeerSource
 }
 
-// New creates the dashboard handler.
-func New(m *stats.Stats, s *store.Store, h *history.DB, version string) *Handler {
-	return &Handler{stats: m, store: s, hist: h, version: version}
+// New creates the dashboard handler. peers reports the neighbour cache
+// health shown on the dashboard; nil means this proxy is standalone.
+func New(m *stats.Stats, s *store.Store, h *history.DB, version string, peers PeerSource) *Handler {
+	return &Handler{stats: m, store: s, hist: h, version: version, peers: peers}
+}
+
+// neighbours returns the current fleet status, if any.
+func (h *Handler) neighbours() []fleet.Status {
+	if h.peers == nil {
+		return nil
+	}
+	return h.peers.Statuses()
 }
 
 // ServeHTTP routes /, /static/*, /api/dashboard, /api/history and
@@ -110,10 +130,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // state collects the full dashboard state in one consistent read.
 func (h *Handler) state() dashboardPayload {
 	return dashboardPayload{
-		Version: h.version,
-		Stats:   h.stats.Snapshot(),
-		Store:   h.store.Summary(),
-		Modules: h.store.Modules(),
+		Version:    h.version,
+		Stats:      h.stats.Snapshot(),
+		Store:      h.store.Summary(),
+		Modules:    h.store.Modules(),
+		Neighbours: h.neighbours(),
 	}
 }
 
@@ -192,9 +213,10 @@ func (h *Handler) statsState() ([]byte, error) {
 // storeState renders the cache summary and module table.
 func (h *Handler) storeState() ([]byte, error) {
 	return json.Marshal(statePayload{
-		Version: h.version,
-		Store:   h.store.Summary(),
-		Modules: h.store.Modules(),
+		Version:    h.version,
+		Store:      h.store.Summary(),
+		Modules:    h.store.Modules(),
+		Neighbours: h.neighbours(),
 	})
 }
 

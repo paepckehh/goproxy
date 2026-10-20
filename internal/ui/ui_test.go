@@ -11,12 +11,18 @@ import (
 	"testing"
 	"time"
 
+	"paepcke.de/goproxy/internal/fleet"
 	"paepcke.de/goproxy/internal/history"
 	"paepcke.de/goproxy/internal/stats"
 	"paepcke.de/goproxy/internal/store"
 )
 
 func newTestUI(t *testing.T) *Handler {
+	t.Helper()
+	return newTestUIWithPeers(t, nil)
+}
+
+func newTestUIWithPeers(t *testing.T, peers PeerSource) *Handler {
 	t.Helper()
 	st, err := store.New(t.TempDir())
 	if err != nil {
@@ -30,8 +36,12 @@ func newTestUI(t *testing.T) *Handler {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { hist.Close() })
-	return New(stats.New(nil), st, hist, "v0.0.0-test")
+	return New(stats.New(nil), st, hist, "v0.0.0-test", peers)
 }
+
+type fakePeers []fleet.Status
+
+func (f fakePeers) Statuses() []fleet.Status { return f }
 
 func TestUI_IndexServesDashboard(t *testing.T) {
 	t.Parallel()
@@ -313,7 +323,7 @@ func TestUI_EventsSSEStreamsNewEvents(t *testing.T) {
 		<-runDone
 	}()
 
-	reader := openSSE(t, New(m, st, hist, "v0.0.0-test"), "")
+	reader := openSSE(t, New(m, st, hist, "v0.0.0-test", nil), "")
 
 	// A fresh stream seeds the whole dashboard before live traffic.
 	for _, want := range []string{"events", "store", "stats", "history"} {
@@ -450,4 +460,50 @@ func TestUI_EventsSSEPushesCacheUpdates(t *testing.T) {
 		}
 	}
 	t.Fatal("no pushed cache update carrying the new module")
+}
+
+func TestUI_ReportsNeighbourHealth(t *testing.T) {
+	t.Parallel()
+	checked := time.Now().UTC().Truncate(time.Second)
+	h := newTestUIWithPeers(t, fakePeers{
+		{URL: "http://peer1:9090", Online: true, Version: "v1.2.3", LatencyMS: 4, CheckedAt: checked},
+		{URL: "http://peer2:9090", Online: false, Err: "healthz status 503", CheckedAt: checked},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dashboard", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var dash struct {
+		Neighbours []fleet.Status `json:"neighbours"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &dash); err != nil {
+		t.Fatal(err)
+	}
+	if len(dash.Neighbours) != 2 {
+		t.Fatalf("neighbours = %+v, want 2 peers", dash.Neighbours)
+	}
+	if !dash.Neighbours[0].Online || dash.Neighbours[0].Version != "v1.2.3" {
+		t.Errorf("peer 1 = %+v, want online v1.2.3", dash.Neighbours[0])
+	}
+	if dash.Neighbours[1].Online || dash.Neighbours[1].Err == "" {
+		t.Errorf("peer 2 = %+v, want offline with an error", dash.Neighbours[1])
+	}
+
+	// The live push seeds from the same payload, so the dashboard shows the
+	// fleet without an extra request.
+	raw, err := h.storeState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pushed struct {
+		Neighbours []fleet.Status `json:"neighbours"`
+	}
+	if err := json.Unmarshal(raw, &pushed); err != nil {
+		t.Fatal(err)
+	}
+	if len(pushed.Neighbours) != 2 {
+		t.Errorf("pushed neighbours = %+v, want 2 peers", pushed.Neighbours)
+	}
 }

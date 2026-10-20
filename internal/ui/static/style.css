@@ -362,6 +362,9 @@ header {
 .dot.amber { background: var(--amber); box-shadow: 0 0 8px rgba(251, 191, 36, 0.8); }
 .dot.violet { background: var(--violet); box-shadow: 0 0 8px rgba(167, 139, 250, 0.8); }
 
+.fleet { margin-bottom: 18px; }
+.fleet[hidden] { display: none; }
+
 .bottom {
   display: grid;
   grid-template-columns: 1.7fr 1fr;

@@ -13,7 +13,8 @@ policy churn.
   NEIGHBOUR_CACHES (parallel peer lookup before the upstream)
 - secure: validates upstream signatures
 - cool: modern 3D animated business-like dashboard about packages, sources,
-  cache hits/misses, neighbour-cache hits and peer bandwidth, upstream and
+  cache hits/misses, neighbour-cache hits and peer bandwidth, live
+  neighbour-cache health (online state, version, latency), upstream and
   downstream bandwidth used and saved, store size, plus long-term (24h to
   all-time) history charts
 - persistent: long-term stats in the SQLite stats database via the pure-Go
@@ -33,7 +34,10 @@ internal/sumdb       checksum-database verification (x/mod sumdb client)
 internal/stats       lock-free counters, event ring, traffic buckets, recorder flush loop
 internal/history      long-term stats in SQLite (pure-Go driver, WAL, minute buckets)
 internal/proxy       GOPROXY protocol handlers (singleflight, neighbour-first
-                     fetch, verify, cache; fetches detached from client contexts)
+                     fetch, verify, cache; fetches detached from client contexts);
+                     hourly fleet prewarm of the hottest modules
+internal/fleet       neighbour-cache health probes (/healthz, startup + every 10m),
+                     status list rendered by the dashboard
 internal/ui          embedded dashboard (static/, vanilla JS, no external assets);
                      push-only: every update arrives over SSE (/api/events),
                      no fetches, no polling, no client-side refresh timers
@@ -99,6 +103,41 @@ so peers are never trusted. Stats count a peer-served request as a local
 miss plus a neighbour hit, with peer bytes tracked separately from upstream
 bytes (`NeighbourHits`, `NeighbourMisses`, `BytesNeighbour`), persisted in
 the totals and minute buckets and shown on the dashboard.
+
+Fleet health: `internal/fleet` probes every configured neighbour through
+`/healthz` at startup and every 10 minutes (5s per-probe timeout, parallel).
+The dashboard's neighbour card shows each peer's online state, version,
+latency and last check; the neighbour KPI adds the online count. The status
+is part of the `store` SSE message, so it reconciles in place like the
+module table and never triggers a reload. A dead peer never delays a
+request: lookups keep racing it and simply lose.
+
+Fleet sync: at startup (after the cache index scan, which supplies the
+ranking) and then once per hour with ±10 minutes jitter, the proxy resolves
+the latest version of the 100 most requested modules and fetches their
+`.info`, `.mod` and `.zip` through the normal fetch path
+(`internal/proxy/warm.go`). Neighbour caches are therefore asked first and
+one upstream copy serves the fleet. The pass logs one Info line and
+publishes one `prewarm` event; it is not a client request, so
+request/hit/miss counters stay untouched while its bandwidth still counts
+as upstream or peer bytes (`Stats.Prewarm`). The startup pass waits for the
+index scan so it does not run against an empty ranking.
+
+Checksum-database freshness: `sumdb.DB.RefreshLoop` refreshes the signed
+tree head from the database at startup and every 15 minutes. `Refresh`
+fetches `/latest`, verifies the note signature, refuses to roll the
+persisted head back, writes it through the x/mod compare-and-swap config
+path and replaces the in-memory client so the next lookup starts from the
+fresh timeline.
+
+Version queries: a request for `/<module>/@v/<query>.info` where the query
+is not a canonical version (`module.CanonicalVersion(ver) != ver`) is what
+the go command sends for branches, short tags (`v1.2`) and commit hashes.
+It is forwarded upstream with `no-store` and never cached: only the
+upstream can resolve it and the answer moves. `validQuery` keeps such a
+query a single path element. `.mod`/`.zip` requests still require a
+canonical version (400 otherwise), and canonical versions (including
+pseudo-versions and `+incompatible`) stay on the cached, verified path.
 
 Security: misses are verified against sum.golang.org (note signature + tlog
 tree + tiles) before caching; a hash mismatch refuses content (502); no

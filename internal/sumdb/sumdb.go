@@ -9,6 +9,7 @@ package sumdb
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ import (
 	"golang.org/x/mod/sumdb"
 	"golang.org/x/mod/sumdb/dirhash"
 	"golang.org/x/mod/sumdb/note"
+	"golang.org/x/mod/sumdb/tlog"
 )
 
 // DefaultKey is the public key of sum.golang.org.
@@ -55,12 +57,13 @@ type Record struct {
 
 // DB is a checksum database client with persisted verification state.
 type DB struct {
-	base *url.URL
-	key  string
-	name string
-	dir  string
-	http *http.Client
-	log  *slog.Logger
+	base     *url.URL
+	key      string
+	name     string
+	verifier note.Verifier
+	dir      string
+	http     *http.Client
+	log      *slog.Logger
 
 	// clientMu guards client. The x/mod client caches every lookup result,
 	// including transient network and tile errors, for the lifetime of the
@@ -94,7 +97,8 @@ func New(base, key, stateDir string, client *http.Client, log *slog.Logger) (*DB
 			return nil, fmt.Errorf("sumdb: create state dir: %w", err)
 		}
 	}
-	db := &DB{base: u, key: key, name: verifier.Name(), dir: stateDir, http: client, log: log}
+	db := &DB{base: u, key: key, name: verifier.Name(), verifier: verifier,
+		dir: stateDir, http: client, log: log}
 	db.client = sumdb.NewClient(db)
 	return db, nil
 }
@@ -171,6 +175,109 @@ func (db *DB) Lookup(mod, ver string) (*Record, error) {
 		rec.Raw = string(raw)
 	}
 	return rec, nil
+}
+
+// Refresh fetches the latest signed tree head from the database server,
+// verifies its signature, and persists it when it is newer than the head
+// already stored. A long-running proxy therefore keeps a current view of the
+// transparency log instead of only learning about new entries while it
+// happens to verify a module. The x/mod client keeps the head in memory, so
+// the client is replaced after the persisted head advances.
+func (db *DB) Refresh(ctx context.Context) error {
+	u := *db.base
+	u.Path = db.base.Path + "/latest"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("sumdb: latest tree head: %w", err)
+	}
+	resp, err := db.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("sumdb: latest tree head: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("sumdb: latest tree head: status %d", resp.StatusCode)
+	}
+	msg, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("sumdb: latest tree head: %w", err)
+	}
+	verifiers := note.VerifierList(db.verifier)
+	verified, err := note.Open(msg, verifiers)
+	if err != nil {
+		return fmt.Errorf("sumdb: latest tree head: %w", err)
+	}
+	tree, err := tlog.ParseTree([]byte(verified.Text))
+	if err != nil {
+		return fmt.Errorf("sumdb: latest tree head: %w", err)
+	}
+
+	file := db.name + "/latest"
+	advanced := false
+	for range 3 {
+		old, err := db.ReadConfig(file)
+		if err != nil {
+			return err
+		}
+		if treeSize(old, verifiers) >= tree.N {
+			// Never roll the persisted head back; the stored one is at
+			// least as new.
+			return nil
+		}
+		err = db.WriteConfig(file, old, msg)
+		if err == nil {
+			advanced = true
+			break
+		}
+		if !errors.Is(err, sumdb.ErrWriteConflict) {
+			return fmt.Errorf("sumdb: persisting tree head: %w", err)
+		}
+	}
+	if !advanced {
+		// A concurrent writer kept winning; the next refresh retries.
+		return nil
+	}
+	db.discardClient(db.clientSnapshot())
+	db.log.Debug("sumdb: tree head refreshed", "tree", tree.N)
+	return nil
+}
+
+// RefreshLoop refreshes the checksum database state at startup and then
+// every interval until ctx is cancelled.
+func (db *DB) RefreshLoop(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if err := db.Refresh(ctx); err != nil && ctx.Err() == nil {
+			db.log.Debug("sumdb: refreshing tree head", "err", err)
+		}
+		timer.Reset(interval)
+	}
+}
+
+// treeSize returns the tree size of a signed note, or -1 when the note is
+// absent or unparsable. An empty note is the valid empty timeline.
+func treeSize(msg []byte, verifiers note.Verifiers) int64 {
+	if len(msg) == 0 {
+		return 0
+	}
+	n, err := note.Open(msg, verifiers)
+	if err != nil {
+		return -1
+	}
+	tree, err := tlog.ParseTree([]byte(n.Text))
+	if err != nil {
+		return -1
+	}
+	return tree.N
 }
 
 // lookupCacheFile mirrors the client's cache path for a lookup response.

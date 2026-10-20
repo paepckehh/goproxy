@@ -86,7 +86,7 @@ func TestE2E_FullStackFetchesRealModule(t *testing.T) {
 		t.Fatal(err)
 	}
 	const version = "v0.0.0-e2e"
-	uiH := ui.New(m, st, hist, version)
+	uiH := ui.New(m, st, hist, version, nil)
 	srv := httptest.NewServer(dispatch(p, uiH, version))
 	t.Cleanup(srv.Close)
 

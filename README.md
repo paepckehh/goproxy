@@ -22,10 +22,14 @@ Point your toolchain at goproxy and every module download flows through a
 local archive. Once a module is fetched it is stored as received and served
 from disk, so builds keep working without calling the cloud upstream again.
 A fleet can chain proxies: a miss asks the configured neighbour caches in
-parallel before it reaches the upstream, so warm caches are shared.
+parallel before it reaches the upstream, so warm caches are shared. Peers
+are health-probed at startup and every 10 minutes, the dashboard shows each
+one's state, and the hottest 100 modules are re-warmed at startup and hourly
+so the fleet keeps a shared hot set without lockstep upstream bursts.
 Point a browser at it and watch the archive work: hit ratio, bandwidth
-saved, upstream, downstream and neighbour traffic, top modules, a live
-event feed, and long-term history charts from 24 hours to all time.
+saved, upstream, downstream and neighbour traffic, neighbour-cache health,
+top modules, a live event feed, and long-term history charts from 24 hours
+to all time.
 
 This is long-term storage, not a disposable cache: files never expire, the
 `download/` tree is portable and backup-friendly, and upstream bandwidth is
@@ -40,7 +44,7 @@ Everything a fleet of build machines needs, in one dependency-free binary.
 | --- | --- |
 | **Fast** | In-memory index over a standard `download/` layout, singleflight download dedup, atomic cache commits, `sendfile`-backed serving, negative caching of upstream 404s, parallel neighbour-cache lookup before the upstream |
 | **Archival** | Long-term module storage, not a disposable cache: files never expire, are stored as received, and serve straight from disk without the cloud upstream. The standard `download/` tree is portable, backup-friendly and usable as a `file://` proxy source |
-| **Shared** | `NEIGHBOUR_CACHES` chains goproxy instances: a cache miss asks every peer in parallel (short header timeout), the first copy wins, the rest are cancelled, and only a full peer miss falls through to the upstream |
+| **Shared** | `NEIGHBOUR_CACHES` chains goproxy instances: a cache miss asks every peer in parallel (short header timeout), the first copy wins, the rest are cancelled, and only a full peer miss falls through to the upstream. Peers are probed at startup and every 10 minutes (status, version and latency on the dashboard), and the top 100 modules are re-warmed at startup and once per jittered hour |
 | **Secure** | Every `.zip` and `.mod` is hash-verified against the signed sum.golang.org checksum database: Ed25519 note signature, transparency-log tree consistency, and tile inclusion proofs. Tampered content is refused, never cached |
 | **Observable** | Embedded dashboard with zero external assets, pushed live over one SSE stream (counters, cache table, events, history): hit ratio, bandwidth saved, traffic, store usage, a 3D top-modules chart with a static side agenda linked by color (module names never rotate with the scene), live event feed, and 24h to all-time history charts |
 | **Persistent** | Lifetime counters, per-module served bandwidth (requests, bytes, last use), minute-resolution buckets and the event log survive restarts and reboots in SQLite (pure-Go driver, WAL journaling) |
@@ -114,11 +118,12 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 | `GET /<module>/@v/list` | forwarded upstream (`no-store`) |
 | `GET /<module>/@latest` | forwarded upstream (`no-store`) |
 | `GET /<module>/@v/<v>.info` | cached, JSON-validated |
+| `GET /<module>/@v/<query>.info` | a version query the go command sends for branches, short tags (`v1.2`) and commit hashes: forwarded upstream (`no-store`), never cached, because the answer moves. Canonical versions (`v1.2.3`, pseudo-versions, `+incompatible`) stay on the cached path |
 | `GET /<module>/@v/<v>.mod` | cached, hash-verified against the checksum database |
 | `GET /<module>/@v/<v>.zip` | cached, hash-verified against the checksum database; on a miss the neighbour caches are asked in parallel first |
 | `GET /sumdb/<db>/...` | forwarded verbatim to the configured database only (404 otherwise), with the `/supported` probe answered locally, so go clients run their full verification through the proxy |
 | `GET /` | operations dashboard (push-only: every update arrives over SSE; no fetching, polling or client-side timers) |
-| `GET /api/dashboard` | JSON snapshot for scripts and probes (the dashboard page does not use it) |
+| `GET /api/dashboard` | JSON snapshot for scripts and probes (the dashboard page does not use it); includes the neighbour-cache fleet status |
 | `GET /api/events?range=24h` | Server-Sent Events stream: `events` seed, `store` cache table (only when changed), `stats` counters every 2s, `history` for the selected range every 30s, a `tick` every 25s that ages timestamps, and one `event` message per new proxy event |
 | `GET /api/history?range=24h` | long-term stats series (`24h`, `7d`, `30d`, `1y`, `all`) |
 | `GET /healthz` | liveness plus version |
@@ -146,6 +151,7 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 | `internal/proxy` | GOPROXY protocol handlers: singleflight, neighbour-first fetch, verify, cache; fetches detached from client contexts |
 | `internal/stats` | lock-free counters, event ring, traffic buckets, recorder flush loop |
 | `internal/history` | long-term stats in SQLite (pure-Go driver, WAL, minute buckets) |
+| `internal/fleet` | neighbour-cache health probes (startup, then every 10 minutes) |
 | `internal/ui` | embedded dashboard (static files, vanilla JS, no external assets) |
 | `internal/systemd` | `LISTEN_FDS` socket-activation listener intake |
 | `internal/version` | version injected via `-ldflags` |
@@ -170,6 +176,21 @@ those requests as **neighbour hits** (still a local cache miss, because the
 local index was cold) and tracks bytes pulled from peers separately from
 upstream bytes in the lifetime counters, the minute buckets and the history
 views. A neighbour must not list itself; duplicate entries are ignored.
+
+Each peer is health-probed at startup and every 10 minutes through its
+`/healthz` endpoint. The dashboard's **Neighbour caches** card lists every
+peer with its state, version, probe latency and last check, and the
+neighbour KPI adds the online count. A peer that is down never stalls
+requests: lookups keep racing it and simply lose.
+
+The fleet also stays warm on its own. At startup and then once per hour
+(jittered by ±10 minutes so proxies do not hit the upstream in lockstep)
+the proxy resolves the latest version of the 100 most requested modules and
+fetches their `.info`, `.mod` and `.zip` through the regular path, so a
+neighbour that already has the content serves it and one upstream copy
+serves the whole fleet. The pass is logged and published as a `prewarm`
+event; it is not a client request, so request/hit/miss counters stay clean
+while the bandwidth it spends is still counted as upstream or peer traffic.
 
 ```sh
 NEIGHBOUR_CACHES=http://goproxy1:9090,http://goproxy2:9090 ./goproxy
@@ -225,6 +246,11 @@ are all checked. The downloaded zip/mod hash is compared against the record:
 | No record (private or unpublished module) | served unverified, clearly marked |
 | Record without a hash line for this kind (custom databases) | served unverified, never refused |
 | Database unreachable with `verify=true` | the request fails closed |
+
+The signed tree head is refreshed from the database at startup and every
+15 minutes (signature verified, never rolled back), so a long-running proxy
+keeps a current transparency-log view instead of only seeing new entries
+while it happens to verify a module.
 
 ## Long-term statistics
 

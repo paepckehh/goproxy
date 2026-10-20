@@ -338,6 +338,40 @@ func (s *Store) Modules() []ModStat {
 	return out
 }
 
+// Popular returns up to limit cached module paths ordered by request count.
+// It is the ranking the hourly cache sync uses to keep the hottest modules
+// of the fleet warm; ties fall back to the path for a stable order.
+func (s *Store) Popular(limit int) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	type entry struct {
+		path     string
+		requests int64
+	}
+	entries := make([]entry, 0, len(s.mods))
+	for _, m := range s.mods {
+		var n int64
+		if u := s.usage[m.Path]; u != nil {
+			n = u.requests.Load()
+		}
+		entries = append(entries, entry{path: m.Path, requests: n})
+	}
+	slices.SortFunc(entries, func(a, b entry) int {
+		if c := cmp.Compare(b.requests, a.requests); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.path, b.path)
+	})
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	out := make([]string, len(entries))
+	for i, e := range entries {
+		out[i] = e.path
+	}
+	return out
+}
+
 // RestoreUsage seeds the per-module access counters from persistent
 // storage before the cache index is scanned. Counters recorded later add
 // to the restored totals, so the dashboard keeps its history across

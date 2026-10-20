@@ -1,6 +1,6 @@
 "use strict";
 
-const state = { version: "", stats: null, store: null, modules: [], historyRange: "24h" };
+const state = { version: "", stats: null, store: null, modules: [], neighbours: [], historyRange: "24h" };
 const counters = new Map(); // element id -> last numeric value
 
 const $ = (id) => document.getElementById(id);
@@ -104,18 +104,25 @@ function renderKPIs(s, store) {
     fmtNum(store.modules) + " modules · " + fmtNum(store.versions) + " versions · " + fmtNum(store.files) + " files";
 
   countUp("kpi-neighbour", L.neighbourHits, fmtNum);
-  $("kpi-neighbour-sub").textContent = neighbourSub(L);
+  $("kpi-neighbour-sub").textContent = neighbourSub(L, state.neighbours);
 }
 
-// Neighbour caches: how often a peer had the artifact and how much
-// bandwidth that saved us from pulling from the upstream proxy.
-function neighbourSub(L) {
+// Neighbour caches: how often a peer had the artifact, how much bandwidth
+// that saved us from pulling from the upstream proxy, and how many peers
+// the health probe currently sees online.
+function neighbourSub(L, peers) {
   const hits = L.neighbourHits || 0;
   const misses = L.neighbourMisses || 0;
-  if (hits === 0 && misses === 0) return "no neighbour lookups yet";
-  const fetched = fmtBytes(L.bytesNeighbour || 0) + " from neighbours";
-  if (misses === 0) return fetched;
-  return fetched + " · " + fmtNum(misses) + " fell back upstream";
+  let text = "no neighbour lookups yet";
+  if (hits > 0 || misses > 0) {
+    text = fmtBytes(L.bytesNeighbour || 0) + " from neighbours";
+    if (misses > 0) text += " · " + fmtNum(misses) + " fell back upstream";
+  }
+  if (peers && peers.length) {
+    const online = peers.filter((p) => p.online).length;
+    text += " · " + online + "/" + peers.length + " peers online";
+  }
+  return text;
 }
 
 function shortMod(path) {
@@ -656,7 +663,57 @@ function applyStore(payload) {
     renderModules(payload.modules);
     chart3d.setData(payload.modules);
   }
+  renderNeighbours(payload.neighbours);
   if (state.stats) renderKPIs(state.stats, state.store);
+}
+
+// Neighbour caches: one row per configured peer, reconciled in place so a
+// probe result never rebuilds the table. The card is hidden entirely on a
+// standalone proxy with no peers.
+function renderNeighbours(list) {
+  state.neighbours = Array.isArray(list) ? list : [];
+  const section = $("fleet");
+  if (!section) return;
+  section.hidden = state.neighbours.length === 0;
+  if (!state.neighbours.length) return;
+  const online = state.neighbours.filter((p) => p.online).length;
+  $("fleet-hint").textContent =
+    online + "/" + state.neighbours.length + " online · probed every 10 min";
+  const body = $("fleet-body");
+  const rows = new Map();
+  for (const tr of body.children) rows.set(tr.dataset.url, tr);
+  const seen = new Set();
+  for (const peer of state.neighbours) {
+    seen.add(peer.url);
+    let tr = rows.get(peer.url);
+    if (!tr) {
+      tr = document.createElement("tr");
+      tr.dataset.url = peer.url;
+      tr.innerHTML = `<td><span class="path"></span></td><td></td>
+        <td class="dim"></td><td class="r"></td><td class="dim" data-time=""></td>`;
+      body.appendChild(tr);
+    }
+    updateNeighbourRow(tr, peer);
+  }
+  for (const [url, tr] of rows) {
+    if (!seen.has(url)) tr.remove();
+  }
+}
+
+function updateNeighbourRow(tr, peer) {
+  const cells = tr.children;
+  cells[0].firstChild.textContent = peer.url;
+  let chip = cells[1].firstChild;
+  if (!chip) {
+    chip = document.createElement("span");
+    cells[1].appendChild(chip);
+  }
+  chip.className = "chip " + (peer.online ? "ok" : "bad");
+  chip.textContent = peer.online ? "online" : "offline";
+  chip.title = peer.err || "";
+  cells[2].textContent = peer.version || "—";
+  cells[3].textContent = peer.online ? peer.latencyMs + " ms" : "—";
+  cells[4].dataset.time = peer.checkedAt && !peer.checkedAt.startsWith("0001") ? peer.checkedAt : "";
 }
 
 function applyHistory(data) {
@@ -686,7 +743,7 @@ function parseSSE(msg) {
 // Relative timestamps age only when the server pushes; the stream's tick
 // keeps them fresh without a client-side timer or another request.
 function refreshAges() {
-  document.querySelectorAll("#events [data-time], #modules-body [data-time]").forEach((el) => {
+  document.querySelectorAll("#events [data-time], #modules-body [data-time], #fleet-body [data-time]").forEach((el) => {
     el.textContent = el.dataset.time ? ago(el.dataset.time) : "never";
   });
 }
