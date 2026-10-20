@@ -48,6 +48,9 @@ generate:
 test:
 	CGO_ENABLED=1 go test -race -count=1 -parallel $$(nproc) -p $$(nproc) ./...
 
+test-e2e:
+	GOPROXY_E2E=1 CGO_ENABLED=1 go test -race -count=1 -run E2E ./internal/proxy ./cmd/goproxy
+
 cloc:
 	go run github.com/boyter/scc/v4@latest
 

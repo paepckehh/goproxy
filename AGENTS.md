@@ -168,6 +168,11 @@ Always load `golang-how-to` before Go work here; typically also `golang-testing`
 1. **Format + check**: `gofmt, go vet, go mod tidy -check`
 2. **Build**: `go build -o goproxy ./cmd/goproxy`
 3. **Test**: `make test` (to run all tests here, ensure its fully parallel).
+   Real-network end-to-end tests are opt-in: `make test-e2e` sets
+   `GOPROXY_E2E=1` and fetches `rsc.io/quote@v1.5.2` from proxy.golang.org,
+   verifies it against sum.golang.org, and checks the dashboard/SSE path
+   end to end. Without the env var (or without network) they skip, so
+   `make test` stays hermetic.
 4. **Generate**: make generate, include in commit 
 6. **Commit**: `git add . && git commit -m '<useful commit message>'`.
 7. **Tag**: bump the patch segment only, never reuse/move/delete a tag
@@ -175,7 +180,10 @@ Always load `golang-how-to` before Go work here; typically also `golang-testing`
 8. **Push**: `git pull && git pull --tags && git push && git push --tags`.
 
 Notes: `-race` tests need `CGO_ENABLED=1` (dev/test only; the shipped binary is
-built `CGO_ENABLED=0`). Run a local instance with
+built `CGO_ENABLED=0`). `make test-e2e` exercises the real upstream and
+checksum database (`internal/proxy/e2e_test.go`, `cmd/goproxy/e2e_test.go`);
+their expected hashes come from the published sum.golang.org record. Run a
+local instance with
 `./goproxy -addr 127.0.0.1:5100 -root /tmp/cache` and exercise it via
 `GOPROXY=http://127.0.0.1:5100 go mod download <mod>@<ver>`; watch `/api/dashboard`
 and `/api/history?range=24h` (also `7d`, `30d`, `1y`, `all`). Socket-activated

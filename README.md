@@ -267,7 +267,8 @@ down. Ingress (caddy vhost, TLS, listen IP) is host-side configuration.
 
 ```sh
 make build      # versioned binary
-make test       # parallel tests with race detector
+make test       # parallel tests with race detector (hermetic)
+make test-e2e   # real upstream + sum.golang.org fetch, opt-in
 make check      # gofmt, go vet, go mod tidy -diff
 make generate   # go generate ./...
 make release-check     # validate .goreleaser.yml
@@ -275,7 +276,11 @@ make release-snapshot  # local GoReleaser dry run
 ```
 
 Notes: `-race` tests need `CGO_ENABLED=1` (dev/test only; the shipped
-binary is built `CGO_ENABLED=0`). Exercise a local instance with
+binary is built `CGO_ENABLED=0`). `make test-e2e` fetches
+`rsc.io/quote@v1.5.2` from proxy.golang.org, verifies it against the
+published sum.golang.org record, and drives the dashboard API and SSE feed
+through the real handler tree; it skips without `GOPROXY_E2E=1` or network
+access, so the regular suite stays hermetic. Exercise a local instance with
 `./goproxy -addr 127.0.0.1:5100 -root /tmp/cache` and
 `GOPROXY=http://127.0.0.1:5100 go mod download <mod>@<ver>`, then watch
 `/api/dashboard` and `/api/history?range=24h`; the event feed streams

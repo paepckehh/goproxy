@@ -46,7 +46,7 @@ var ErrNotFound = errors.New("store: not found")
 type File struct {
 	Path      string
 	Size      int64
-	Hash      string // h1: hash from the checksum database, when known
+	Hash      string // checksum-database hash, base64 without the h1: prefix
 	Verified  bool   // hash was checked against the signed record
 	FetchedAt time.Time
 
@@ -162,7 +162,7 @@ func (s *Store) Put(mod, ver string, kind Kind, tmpPath, hash string, verified b
 	f := &File{
 		Path:      final,
 		Size:      fi.Size(),
-		Hash:      hash,
+		Hash:      strings.TrimPrefix(hash, "h1:"),
 		Verified:  verified,
 		FetchedAt: time.Now().UTC(),
 	}
