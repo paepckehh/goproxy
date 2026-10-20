@@ -2,9 +2,9 @@
 
 # goproxy
 
-**A fast, checksum-verifying Go module proxy with a live operations dashboard.**
+**A local-first Go module archive and proxy, built to de-cloud your builds.**
 
-Single binary &middot; zero cgo &middot; SQLite-backed long-term statistics
+Single binary &middot; zero cgo &middot; checksum-verified &middot; SQLite-backed long-term statistics
 
 [![Go Version](https://img.shields.io/github/go-mod/go-version/paepckehh/goproxy)](https://go.dev/)
 [![Release](https://img.shields.io/github/v/release/paepckehh/goproxy)](https://github.com/paepckehh/goproxy/releases)
@@ -19,11 +19,18 @@ Single binary &middot; zero cgo &middot; SQLite-backed long-term statistics
 ---
 
 Point your toolchain at goproxy and every module download flows through a
-local cache. A fleet can chain proxies: a miss asks the configured neighbour
-caches in parallel before it reaches the upstream, so warm caches are shared.
-Point a browser at it and watch the cache work: hit ratio, bandwidth saved,
-upstream, downstream and neighbour traffic, top modules, a live event feed,
-and long-term history charts from 24 hours to all time.
+local archive. Once a module is fetched it is stored as received and served
+from disk, so builds keep working without calling the cloud upstream again.
+A fleet can chain proxies: a miss asks the configured neighbour caches in
+parallel before it reaches the upstream, so warm caches are shared.
+Point a browser at it and watch the archive work: hit ratio, bandwidth
+saved, upstream, downstream and neighbour traffic, top modules, a live
+event feed, and long-term history charts from 24 hours to all time.
+
+This is long-term storage, not a disposable cache: files never expire, the
+`download/` tree is portable and backup-friendly, and upstream bandwidth is
+spent only on a true cold miss. Fewer cloud round trips, fewer rate limits,
+less dependence on one vendor's mood.
 
 Everything a fleet of build machines needs, in one dependency-free binary.
 
@@ -32,17 +39,18 @@ Everything a fleet of build machines needs, in one dependency-free binary.
 | Category | What you get |
 | --- | --- |
 | **Fast** | In-memory index over a standard `download/` layout, singleflight download dedup, atomic cache commits, `sendfile`-backed serving, negative caching of upstream 404s, parallel neighbour-cache lookup before the upstream |
+| **Archival** | Long-term module storage, not a disposable cache: files never expire, are stored as received, and serve straight from disk without the cloud upstream. The standard `download/` tree is portable, backup-friendly and usable as a `file://` proxy source |
 | **Shared** | `NEIGHBOUR_CACHES` chains goproxy instances: a cache miss asks every peer in parallel (short header timeout), the first copy wins, the rest are cancelled, and only a full peer miss falls through to the upstream |
 | **Secure** | Every `.zip` and `.mod` is hash-verified against the signed sum.golang.org checksum database: Ed25519 note signature, transparency-log tree consistency, and tile inclusion proofs. Tampered content is refused, never cached |
 | **Observable** | Embedded dashboard with zero external assets, pushed live over one SSE stream (counters, cache table, events, history): hit ratio, bandwidth saved, traffic, store usage, a 3D top-modules chart with a static side agenda linked by color (module names never rotate with the scene), live event feed, and 24h to all-time history charts |
-| **Persistent** | Lifetime counters, minute-resolution buckets and the event log survive reboots in SQLite (pure-Go driver, WAL journaling) |
+| **Persistent** | Lifetime counters, per-module served bandwidth (requests, bytes, last use), minute-resolution buckets and the event log survive restarts and reboots in SQLite (pure-Go driver, WAL journaling) |
 | **Deployable** | Socket activation with idle exit, hardened systemd units, NixOS modules, static cgo-free binary |
 | **Honest failure** | Checksum-database outages fail closed (a missing tile is an outage, not an unknown module); recorder errors surface as warning pills on the dashboard (`persistErrors`, dropped events) and never degrade proxying |
 
 ## Quick start
 
 ```sh
-./goproxy                                 # serves :5100, caches ./cache
+./goproxy                                 # serves :5100, archives into ./cache
 ```
 
 ```sh
@@ -190,6 +198,18 @@ NEIGHBOUR_CACHES=http://goproxy1:9090,http://goproxy2:9090 ./goproxy
   `StateDirectory`), otherwise next to the cache at `<root>/stats.db` for
   unprivileged runs. Wiping the module cache leaves a systemd-managed
   history untouched; the local fallback is lost with the cache.
+
+### Archive, not a throwaway cache
+
+- Files are never expired or evicted. The cache root is the archive.
+- Serving an archived module is pure disk I/O: no upstream request and no
+  repeated checksum-database lookup (the signed record stays beside the
+  files as provenance).
+- The standard `download/` layout is self-describing, so the archive can be
+  copied, rsynced, snapshotted or served by `file://` without goproxy.
+- Upstream bandwidth is spent only on a cold miss (or when the optional
+  neighbour fleet has no copy), which de-clouds repetitive fleet builds and
+  removes dependence on upstream uptime, rate limits and policy changes.
 
 ## Verification model
 

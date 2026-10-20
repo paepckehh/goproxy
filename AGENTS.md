@@ -2,6 +2,12 @@
 
 `paepcke.de/goproxy` — single-binary go proxy, public mirror at
 github.com/paepckehh/goproxy, BSD-3-Clause (see LICENSE).
+Local-first long-term module archive: the cache is storage, not a
+disposable buffer. Fetched modules are stored as received, never expired,
+served from disk, and can be copied or backed up in the standard `download/`
+layout. Upstream bandwidth is spent only on a true cold miss, which
+de-clouds builds and reduces dependence on upstream uptime, rate limits and
+policy churn.
 - modern single binary, cgo and runtime dependency free
 - fast: modern caching go mod proxy; a fleet chains warm caches via
   NEIGHBOUR_CACHES (parallel peer lookup before the upstream)

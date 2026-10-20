@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>goproxy — operations dashboard</title>
+<meta name="description" content="goproxy: local-first long-term Go module archive and checksum-verifying proxy that keeps builds working without cloud upstream dependencies.">
+<title>goproxy — local Go module archive</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%236366f1'/%3E%3Cstop offset='1' stop-color='%2322d3ee'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='2' y='2' width='28' height='28' rx='7' fill='url(%23g)'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='16' font-weight='bold' text-anchor='middle' fill='%2305070f'%3EG%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -14,7 +15,7 @@
     <div class="logo">G</div>
     <div>
       <h1>goproxy</h1>
-      <p>Go module proxy · cache · checksum verification</p>
+      <p>Local-first Go module archive · checksum verification</p>
     </div>
   </div>
   <div class="status">
@@ -57,7 +58,7 @@
       <span class="sub" id="kpi-up-sub">—</span>
     </div>
     <div class="card kpi" style="--i:5">
-      <span class="label">Cache store</span>
+      <span class="label">Archive store</span>
       <span class="value" id="kpi-store">0 B</span>
       <span class="sub" id="kpi-store-sub">—</span>
     </div>
@@ -119,7 +120,7 @@
   <section class="bottom">
     <div class="card table-card">
       <div class="card-head">
-        <h2>Cached modules</h2>
+        <h2>Archived modules</h2>
         <span class="hint" id="modules-hint"></span>
       </div>
       <table>
@@ -129,7 +130,7 @@
         </tr></thead>
         <tbody id="modules-body"></tbody>
       </table>
-      <div class="empty" id="modules-empty">cache is empty — run a build through the proxy</div>
+      <div class="empty" id="modules-empty">archive is empty — run a build through the proxy</div>
     </div>
     <div class="card events-card">
       <div class="card-head">
@@ -141,6 +142,11 @@
     </div>
   </section>
 </main>
+
+<footer>
+  <span><b>Long-term archive.</b> Modules are stored as received, never expire, and are served from disk; the cloud upstream is contacted only on a cold miss.</span>
+  <span>History, cache state and served bandwidth persist in SQLite.</span>
+</footer>
 
 <script src="/static/app.js" defer></script>
 </body>

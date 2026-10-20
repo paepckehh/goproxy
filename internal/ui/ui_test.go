@@ -50,6 +50,9 @@ func TestUI_IndexServesDashboard(t *testing.T) {
 	if !strings.Contains(body, "chart-history") {
 		t.Error("dashboard html missing the long-term history section")
 	}
+	if !strings.Contains(body, "Long-term archive") {
+		t.Error("dashboard html missing the long-term archive positioning")
+	}
 	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Errorf("content type = %q", ct)
 	}
