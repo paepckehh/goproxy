@@ -101,7 +101,10 @@ in {
         SocketBindDeny = "any";
         SocketBindAllow = "tcp:${toString cfg.port}";
         # Egress deliberately unrestricted: fetching and verifying from the
-        # upstream proxy and sum.golang.org is the service's job.
+        # upstream proxy and sum.golang.org is the service's job. Never add
+        # IPAddressDeny/IPAddressAllow here: they filter the cgroup's egress
+        # too, and an allow-list of loopback makes every upstream dial time
+        # out ("dial tcp ...: i/o timeout"), breaking all cache misses.
       };
     };
   };

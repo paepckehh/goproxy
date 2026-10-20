@@ -739,7 +739,8 @@ func TestProxy_UpstreamUnreachableFailsClosed(t *testing.T) {
 	url := dead.URL
 	dead.Close()
 
-	p, err := New(env.store, env.sumdbDB, env.stats, url, true, &http.Client{Timeout: 2 * time.Second}, slog.New(slog.DiscardHandler))
+	var logs bytes.Buffer
+	p, err := New(env.store, env.sumdbDB, env.stats, url, true, &http.Client{Timeout: 2 * time.Second}, slog.New(slog.NewJSONHandler(&logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -748,5 +749,66 @@ func TestProxy_UpstreamUnreachableFailsClosed(t *testing.T) {
 	p.ServeModule(rec, req)
 	if rec.Code != http.StatusBadGateway {
 		t.Errorf("status = %d, want 502", rec.Code)
+	}
+	// The client sees why, and the operator sees it in stderr/journal.
+	if body := rec.Body.String(); !strings.Contains(body, "upstream") {
+		t.Errorf("body = %q, want the upstream failure reason", body)
+	}
+	if got := logs.String(); !strings.Contains(got, "fetch failed") || !strings.Contains(got, testMod) {
+		t.Errorf("logs = %q, want the upstream failure logged with the module", got)
+	}
+}
+
+func TestProxy_UpstreamUnreachablePassthroughLogged(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t, nil)
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := dead.URL
+	dead.Close()
+
+	var logs bytes.Buffer
+	p, err := New(env.store, env.sumdbDB, env.stats, url, true, &http.Client{Timeout: 2 * time.Second}, slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/"+testMod+"/@v/list", nil)
+	rec := httptest.NewRecorder()
+	p.ServeModule(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "upstream unreachable:") {
+		t.Errorf("body = %q, want the dial failure detail", body)
+	}
+	if got := logs.String(); !strings.Contains(got, "upstream unreachable") || !strings.Contains(got, testMod) {
+		t.Errorf("logs = %q, want the upstream failure logged with the module", got)
+	}
+}
+
+func TestProxy_UpstreamErrorStatusLogged(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t, nil)
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "upstream exploded", http.StatusInternalServerError)
+	}))
+	t.Cleanup(broken.Close)
+
+	var logs bytes.Buffer
+	p, err := New(env.store, env.sumdbDB, env.stats, broken.URL, true, broken.Client(), slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/"+testMod+"/@v/list", nil)
+	rec := httptest.NewRecorder()
+	p.ServeModule(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "upstream exploded") {
+		t.Errorf("body = %q, want the upstream body passed through", body)
+	}
+	got := logs.String()
+	if !strings.Contains(got, "upstream refused request") || !strings.Contains(got, "upstream exploded") {
+		t.Errorf("logs = %q, want the upstream status and body logged", got)
 	}
 }

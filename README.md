@@ -104,8 +104,9 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 | `GET /<module>/@v/<v>.mod` | cached, hash-verified against the checksum database |
 | `GET /<module>/@v/<v>.zip` | cached, hash-verified against the checksum database |
 | `GET /sumdb/<db>/...` | forwarded verbatim to the configured database only (404 otherwise), with the `/supported` probe answered locally, so go clients run their full verification through the proxy |
-| `GET /` | operations dashboard (live, polls `/api/dashboard` every 2s) |
+| `GET /` | operations dashboard (live: 2s KPI poll, events pushed over SSE) |
 | `GET /api/dashboard` | JSON: stats, store, modules, events |
+| `GET /api/events` | Server-Sent Events stream: one `event` message per new proxy event |
 | `GET /api/history?range=24h` | long-term stats series (`24h`, `7d`, `30d`, `1y`, `all`) |
 | `GET /healthz` | liveness plus version |
 
@@ -243,7 +244,10 @@ services.go-mod-proxy = {
   capabilities (root only as a stable cache-owner identity), bind syscalls
   pinned to the one listen port (outbound `connect()`/DNS untouched),
   memory 512M cap, full kernel/proc/namespace/keyring isolation; egress
-  is unrestricted by design, fetching from upstream is the job
+  is unrestricted by design, fetching from upstream is the job. Never add
+  `IPAddressDeny`/`IPAddressAllow` here: they filter both directions on
+  the cgroup, so denying everything but loopback makes every cache miss
+  fail with `dial tcp ...: i/o timeout`
 - **availability**: `Restart = always` with a bounded start rate limit
   (3 starts per 30s, then the unit enters `failed` instead of looping),
   `network-online` ordering, bounded 15s stop matching the binary's 10s
@@ -274,7 +278,8 @@ Notes: `-race` tests need `CGO_ENABLED=1` (dev/test only; the shipped
 binary is built `CGO_ENABLED=0`). Exercise a local instance with
 `./goproxy -addr 127.0.0.1:5100 -root /tmp/cache` and
 `GOPROXY=http://127.0.0.1:5100 go mod download <mod>@<ver>`, then watch
-`/api/dashboard` and `/api/history?range=24h`. Socket-activated mode can
+`/api/dashboard` and `/api/history?range=24h`; the event feed streams
+from `/api/events` (SSE). Socket-activated mode can
 be exercised without systemd: pass a listening fd as 3 with
 `LISTEN_FDS=1`, `LISTEN_PID=$$`, `SOCKET_ACTIVATION=1`, `EXIT_ON_IDLE=1`.
 

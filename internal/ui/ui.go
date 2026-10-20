@@ -4,6 +4,8 @@ package ui
 import (
 	"embed"
 	"encoding/json"
+	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"strings"
@@ -46,13 +48,16 @@ func New(m *stats.Stats, s *store.Store, h *history.DB, version string) *Handler
 	return &Handler{stats: m, store: s, hist: h, version: version}
 }
 
-// ServeHTTP routes /, /static/*, /api/dashboard and /api/history.
+// ServeHTTP routes /, /static/*, /api/dashboard, /api/history and
+// /api/events.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/api/dashboard":
 		h.dashboard(w, r)
 	case r.URL.Path == "/api/history":
 		h.history(w, r)
+	case r.URL.Path == "/api/events":
+		h.events(w, r)
 	case r.URL.Path == "/" || r.URL.Path == "/index.html":
 		h.index(w, r)
 	case strings.HasPrefix(r.URL.Path, "/static/"):
@@ -87,6 +92,57 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		// Headers are already sent; nothing more to do.
 		_ = err
+	}
+}
+
+// events streams the live event feed as Server-Sent Events, so the
+// dashboard appends new events instead of re-rendering the whole list on
+// every poll. Each message carries one stats.Event as JSON under the
+// "event" event name; comment lines keep idle connections open.
+func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "goproxy: streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	ch, unsubscribe := h.stats.Subscribe()
+	defer unsubscribe()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Connection", "keep-alive")
+	// Disable proxy buffering (caddy, nginx) so events arrive immediately.
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.WriteString(w, ": connected\n\n"); err != nil {
+		return
+	}
+	fl.Flush()
+
+	keepalive := time.NewTicker(25 * time.Second)
+	defer keepalive.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-keepalive.C:
+			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			fl.Flush()
+		case ev, open := <-ch:
+			if !open {
+				return
+			}
+			data, err := json.Marshal(ev)
+			if err != nil {
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "event: event\ndata: %s\n\n", data); err != nil {
+				return
+			}
+			fl.Flush()
+		}
 	}
 }
 

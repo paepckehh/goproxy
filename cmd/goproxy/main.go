@@ -283,7 +283,7 @@ func dispatch(p *proxy.Proxy, uiH *ui.Handler, ver string) http.Handler {
 		path := r.URL.Path
 		switch {
 		case path == "/" || path == "/index.html" || path == "/api/dashboard" ||
-			path == "/api/history" ||
+			path == "/api/history" || path == "/api/events" ||
 			strings.HasPrefix(path, "/static/") || path == "/favicon.ico":
 			uiH.ServeHTTP(w, r)
 		case path == "/healthz":

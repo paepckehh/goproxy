@@ -311,3 +311,65 @@ func TestStats_EventDropNeverBlocks(t *testing.T) {
 		t.Errorf("hits = %d, want %d", s.hits.Load(), eventChanSize*2)
 	}
 }
+
+func TestStats_SubscribeReceivesLiveEvents(t *testing.T) {
+	t.Parallel()
+	s := fastCollector(nil)
+	stop := run(t, s)
+	defer stop()
+
+	ch, unsubscribe := s.Subscribe()
+	events := make(chan Event, 4)
+	go func() {
+		for ev := range ch {
+			events <- ev
+		}
+	}()
+
+	s.Hit("example.com/m", "v1.0.0", "zip", 128, time.Millisecond)
+	select {
+	case ev := <-events:
+		if ev.Result != "hit" || ev.Module != "example.com/m" || ev.Bytes != 128 {
+			t.Errorf("event = %+v", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber did not receive the event")
+	}
+
+	unsubscribe()
+	waitFor(t, func() bool {
+		select {
+		case _, open := <-ch:
+			return !open
+		default:
+			return false
+		}
+	})
+}
+
+func TestStats_SubscriberOverflowDoesNotBlock(t *testing.T) {
+	t.Parallel()
+	s := fastCollector(nil)
+	stop := run(t, s)
+	defer stop()
+
+	ch, unsubscribe := s.Subscribe() // never drained
+	defer unsubscribe()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range subscriberBuffer * 4 {
+			s.Hit("example.com/m", "v1.0.0", "zip", 1, 0)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("collector blocked on a slow subscriber")
+	}
+	waitFor(t, func() bool { return len(ch) == subscriberBuffer })
+	if len(ch) > subscriberBuffer {
+		t.Errorf("buffered events = %d, want at most %d", len(ch), subscriberBuffer)
+	}
+}

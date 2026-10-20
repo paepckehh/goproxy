@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -212,5 +214,80 @@ func TestUI_UnknownPathNotFound(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestUI_EventsSSEStreamsNewEvents(t *testing.T) {
+	t.Parallel()
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hist, err := history.Open(filepath.Join(t.TempDir(), "stats.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hist.Close()
+
+	m := stats.New(nil)
+	runCtx, stop := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		m.Run(runCtx)
+		close(runDone)
+	}()
+	defer func() {
+		stop()
+		<-runDone
+	}()
+
+	srv := httptest.NewServer(New(m, st, hist, "v0.0.0-test"))
+	defer srv.Close()
+
+	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, srv.URL+"/api/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("content type = %q", ct)
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	// The handler subscribes before sending this comment, so once it is
+	// read the stream is guaranteed to observe following events.
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(line, ": connected") {
+		t.Fatalf("first line = %q", line)
+	}
+
+	m.Hit("example.com/m", "v1.0.0", "zip", 42, time.Millisecond)
+
+	var payload string
+	for {
+		line, err = reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if data, ok := strings.CutPrefix(line, "data: "); ok {
+			payload = strings.TrimSuffix(data, "\n")
+			break
+		}
+	}
+	var ev stats.Event
+	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+		t.Fatalf("event payload %q: %v", payload, err)
+	}
+	if ev.Result != "hit" || ev.Module != "example.com/m" || ev.Bytes != 42 {
+		t.Errorf("event = %+v", ev)
 	}
 }

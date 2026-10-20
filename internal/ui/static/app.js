@@ -141,27 +141,44 @@ function eventChip(result) {
   }
 }
 
-function renderEvents(events) {
-  const ul = $("events");
-  $("events-empty").style.display = events.length ? "none" : "block";
-  $("events-hint").textContent = events.length ? "newest first · " + events.length : "";
-  const items = events.slice(0, 24).map((ev) => {
-    const target = ev.module
-      ? escapeHTML(ev.module) + (ev.version ? " " + escapeHTML(ev.version) : "")
-      : "goproxy";
-    const detail = ev.detail
-      ? escapeHTML(ev.detail)
-      : (ev.kind || "") + (ev.bytes ? " · " + fmtBytes(ev.bytes) : "");
-    return `<li>
+function eventItem(ev) {
+  const target = ev.module
+    ? escapeHTML(ev.module) + (ev.version ? " " + escapeHTML(ev.version) : "")
+    : "goproxy";
+  const detail = ev.detail
+    ? escapeHTML(ev.detail)
+    : (ev.kind || "") + (ev.bytes ? " · " + fmtBytes(ev.bytes) : "");
+  return `<li>
       ${eventChip(ev.result)}
       <div class="ev-main">
         <div class="ev-mod">${target}</div>
         <div class="ev-detail">${detail}</div>
       </div>
-      <span class="ev-time">${ago(ev.time)}</span>
+      <span class="ev-time" data-time="${escapeHTML(ev.time)}">${ago(ev.time)}</span>
     </li>`;
-  });
-  ul.innerHTML = items.join("");
+}
+
+const MAX_EVENTS = 24;
+
+function updateEventsMeta(count) {
+  $("events-empty").style.display = count ? "none" : "block";
+  $("events-hint").textContent = count ? "newest first · live · " + count : "";
+}
+
+// Full render, used for the first paint and after an SSE reconnect.
+function renderEvents(events) {
+  const ul = $("events");
+  ul.innerHTML = events.slice(0, MAX_EVENTS).map(eventItem).join("");
+  updateEventsMeta(ul.children.length);
+}
+
+// Live append: one new node at the top, existing nodes stay untouched so
+// the feed never reloads or loses hover/focus while nothing changes.
+function appendEvent(ev) {
+  const ul = $("events");
+  ul.insertAdjacentHTML("afterbegin", eventItem(ev));
+  while (ul.children.length > MAX_EVENTS) ul.removeChild(ul.lastElementChild);
+  updateEventsMeta(ul.children.length);
 }
 
 function escapeHTML(s) {
@@ -531,7 +548,9 @@ async function poll() {
     renderHeader(data.stats);
     renderKPIs(data.stats, data.store);
     renderModules(state.modules);
-    renderEvents(data.stats.events || []);
+    // With a live SSE stream the event list owns itself; polling only
+    // seeds it and keeps it correct when the stream is unavailable.
+    if (!sseLive) renderEvents(data.stats.events || []);
     chart3d.setData(state.modules);
     drawTraffic(data.stats.traffic);
     setConn(true);
@@ -553,6 +572,57 @@ function setConn(ok) {
 }
 
 chart3d.init();
+
+// ---- Live event feed: server push over SSE ----
+let sseLive = false;
+let sseOpened = false;
+
+async function resyncEvents() {
+  try {
+    const resp = await fetch("/api/dashboard", { cache: "no-store" });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    renderEvents((data.stats && data.stats.events) || []);
+  } catch (err) {
+    // The next reconnect or poll retries.
+  }
+}
+
+function connectEvents() {
+  if (!("EventSource" in window)) return; // polls keep the feed current
+  const sse = new EventSource("/api/events");
+  sse.addEventListener("event", (msg) => {
+    let ev;
+    try {
+      ev = JSON.parse(msg.data);
+    } catch (err) {
+      return;
+    }
+    sseLive = true;
+    appendEvent(ev);
+    setConn(true);
+  });
+  sse.onopen = () => {
+    sseLive = true;
+    setConn(true);
+    // Events emitted while the stream was down are not replayed.
+    if (sseOpened) resyncEvents();
+    sseOpened = true;
+  };
+  sse.onerror = () => {
+    // EventSource reconnects on its own; polling takes over meanwhile.
+    sseLive = false;
+    setConn(false);
+  };
+}
+
+// Relative timestamps age without rebuilding the list.
+setInterval(() => {
+  document.querySelectorAll("#events .ev-time[data-time]").forEach((el) => {
+    el.textContent = ago(el.dataset.time);
+  });
+}, 30000);
+
 document.querySelectorAll("#ranges button").forEach((btn) => {
   btn.addEventListener("click", () => {
     document.querySelectorAll("#ranges button").forEach((b) => b.classList.remove("active"));
@@ -563,5 +633,6 @@ document.querySelectorAll("#ranges button").forEach((btn) => {
 });
 poll();
 fetchHistory();
+connectEvents();
 setInterval(poll, 2000);
 setInterval(fetchHistory, 60000);

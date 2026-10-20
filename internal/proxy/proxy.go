@@ -96,7 +96,22 @@ func New(st *store.Store, db *sumdb.DB, m *stats.Stats, upstream string, verify 
 	// SetURL rewrites the outbound Host header too: sum.golang.org rejects
 	// requests that still carry the proxy's own Host.
 	base := db.Base()
-	rp := &httputil.ReverseProxy{Rewrite: func(r *httputil.ProxyRequest) { r.SetURL(base) }}
+	rp := &httputil.ReverseProxy{
+		Rewrite:   func(r *httputil.ProxyRequest) { r.SetURL(base) },
+		Transport: client.Transport,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Error("proxy: checksum database unreachable",
+				"database", base.Host, "path", r.URL.Path, "err", err)
+			w.WriteHeader(http.StatusBadGateway)
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			if resp.StatusCode != http.StatusOK {
+				log.Error("proxy: checksum database refused request",
+					"database", base.Host, "path", resp.Request.URL.Path, "status", resp.StatusCode)
+			}
+			return nil
+		},
+	}
 	return &Proxy{
 		store:      st,
 		sumdb:      db,
@@ -445,20 +460,30 @@ func (p *Proxy) passThrough(w http.ResponseWriter, r *http.Request, mod, what st
 	u := p.upstream.JoinPath(esc, what)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u.String(), nil)
 	if err != nil {
+		p.log.Error("proxy: building upstream request",
+			"module", modPath, "what", what, "url", u.String(), "err", err)
 		p.stats.Error(modPath, what, err.Error())
 		http.Error(w, "goproxy: bad request", http.StatusBadRequest)
 		return
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
+		p.log.Error("proxy: upstream unreachable",
+			"module", modPath, "what", what, "url", u.String(),
+			"took", time.Since(start).Round(time.Millisecond), "err", err)
 		p.stats.Error(modPath, what, err.Error())
-		http.Error(w, "goproxy: upstream unreachable", http.StatusBadGateway)
+		http.Error(w, "goproxy: upstream unreachable: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 	w.Header().Set("Cache-Control", "no-store")
 	if resp.StatusCode != http.StatusOK {
+		head, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		p.log.Error("proxy: upstream refused request",
+			"module", modPath, "what", what, "url", u.String(), "status", resp.StatusCode,
+			"took", time.Since(start).Round(time.Millisecond), "err", strings.TrimSpace(string(head)))
 		w.WriteHeader(resp.StatusCode)
+		w.Write(head)
 		io.Copy(w, resp.Body)
 		p.stats.UpstreamStatus(modPath, "", what, resp.StatusCode, time.Since(start))
 		return
@@ -472,6 +497,9 @@ func (p *Proxy) passThrough(w http.ResponseWriter, r *http.Request, mod, what st
 func (p *Proxy) serveFetchError(w http.ResponseWriter, err error, mod, ver string, kind store.Kind, start time.Time) {
 	var se *statusError
 	if errors.As(err, &se) {
+		p.log.Error("proxy: upstream refused module file",
+			"module", mod, "version", ver, "kind", kind, "status", se.code,
+			"took", time.Since(start).Round(time.Millisecond), "err", se.body)
 		w.Header().Set("Cache-Control", "no-store")
 		http.Error(w, "goproxy: "+se.body, se.code)
 		p.stats.UpstreamStatus(mod, ver, string(kind), se.code, time.Since(start))
@@ -486,7 +514,7 @@ func (p *Proxy) serveFetchError(w http.ResponseWriter, err error, mod, ver strin
 		return
 	}
 	p.log.Error("proxy: fetch failed", "module", mod, "version", ver, "kind", kind, "err", err)
-	http.Error(w, "goproxy: "+err.Error(), http.StatusBadGateway)
+	http.Error(w, "goproxy: upstream fetch failed: "+err.Error(), http.StatusBadGateway)
 	p.stats.Error(mod, string(kind), err.Error())
 }
 

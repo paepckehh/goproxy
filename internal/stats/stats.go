@@ -14,13 +14,14 @@ import (
 )
 
 const (
-	eventRingSize   = 512
-	trafficRingSize = 120 // two minutes of one-second buckets
-	eventChanSize   = 1024
-	pendingMax      = 8192 // event retry backlog cap; see append
-	maxEventText    = 512  // covers the longest valid module path, bounds hostile input
-	defaultTick     = time.Second
-	defaultFlush    = 30 * time.Second
+	eventRingSize    = 512
+	trafficRingSize  = 120 // two minutes of one-second buckets
+	eventChanSize    = 1024
+	pendingMax       = 8192 // event retry backlog cap; see append
+	maxEventText     = 512  // covers the longest valid module path, bounds hostile input
+	defaultTick      = time.Second
+	defaultFlush     = 30 * time.Second
+	subscriberBuffer = 64
 )
 
 // Event is one operational event for the dashboard feed.
@@ -125,6 +126,8 @@ type Stats struct {
 	evMu      sync.Mutex
 	events    []Event
 	pending   []Event // events awaiting the next recorder flush; Run goroutine only
+	subMu     sync.Mutex
+	subs      map[chan Event]struct{}
 	tMu       sync.Mutex
 	traffic   []Traffic
 	flushMu   sync.Mutex
@@ -264,6 +267,7 @@ func (s *Stats) append(ev Event) {
 		s.events = s.events[len(s.events)-eventRingSize:]
 	}
 	s.evMu.Unlock()
+	s.publish(ev)
 	if s.rec == nil {
 		return
 	}
@@ -276,6 +280,43 @@ func (s *Stats) append(ev Event) {
 		return
 	}
 	s.pending = append(s.pending, ev)
+}
+
+// Subscribe returns a channel that receives every event appended to the
+// feed from now on, plus a function that unregisters it and closes the
+// channel. Delivery is best-effort: a subscriber that cannot keep up misses
+// events (the dashboard re-reads the ring after a reconnect) instead of
+// stalling the collector. The SSE endpoint is the intended consumer.
+func (s *Stats) Subscribe() (<-chan Event, func()) {
+	ch := make(chan Event, subscriberBuffer)
+	s.subMu.Lock()
+	if s.subs == nil {
+		s.subs = make(map[chan Event]struct{})
+	}
+	s.subs[ch] = struct{}{}
+	s.subMu.Unlock()
+	return ch, func() {
+		s.subMu.Lock()
+		if _, ok := s.subs[ch]; ok {
+			delete(s.subs, ch)
+			close(ch)
+		}
+		s.subMu.Unlock()
+	}
+}
+
+// publish fans an event out to the live subscribers. The lock also guards
+// against sending on a channel that a disconnecting subscriber just closed.
+func (s *Stats) publish(ev Event) {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	for ch := range s.subs {
+		select {
+		case ch <- ev:
+		default:
+			// Slow consumer: drop this event rather than block the collector.
+		}
+	}
 }
 
 // flush persists the bucket delta since the last flush, the lifetime

@@ -25,7 +25,9 @@ internal/stats       lock-free counters, event ring, traffic buckets, recorder f
 internal/history      long-term stats in SQLite (pure-Go driver, WAL, minute buckets)
 internal/proxy       GOPROXY protocol handlers (singleflight, verify, cache,
                      fetches detached from client contexts)
-internal/ui          embedded dashboard (static/, vanilla JS, no external assets)
+internal/ui          embedded dashboard (static/, vanilla JS, no external assets);
+                     KPIs poll /api/dashboard, events are pushed over SSE
+                     (/api/events) and appended without re-rendering the list
 internal/systemd     LISTEN_FDS socket-activation listener intake (zero deps)
 internal/version     version injected via -ldflags
 .github/workflows    golang.yml (build/vet/test CI), release.yml (GoReleaser)
@@ -43,13 +45,22 @@ stats persist in the stats database (SQLite, WAL) in the default state dir
 `StateDirectory`), else `<root>/stats.db` for unprivileged local runs:
 lifetime totals table, one
 bucket per minute (requests/hits/misses/bytes + store-size snapshots, kept
-forever) and the event log (pruned after 90d). The request hot path never
+forever) and the event log (pruned after 90d). The dashboard event feed is
+served live over Server-Sent Events: the collector fans each appended event
+out to subscriber channels with a non-blocking send (slow clients miss
+events, never stall the collector), and the page appends new rows instead of
+rebuilding the list. The request hot path never
 touches the DB: atomics + buffered channel, batched flush every 30s plus a
 final flush+WAL checkpoint on shutdown; recorder errors surface as warning
 pills in the dashboard header (`persistErrors`, dropped events) and never
 degrade proxying. Legacy pre-SQLite
 `stats.json` snapshots migrate into `stats.db` on first start (renamed to
 `stats.json.imported`).
+
+Observability: every upstream failure (dial errors, non-200 statuses, checksum
+database errors, tampered content) is logged to stderr as a structured
+`slog` error with module/version/kind/url/duration, so `journalctl -u`
+shows why a fetch failed in addition to the dashboard event feed.
 
 Security: misses are verified against sum.golang.org (note signature + tlog
 tree + tiles) before caching; a hash mismatch refuses content (502); no
@@ -126,7 +137,10 @@ ReadWritePaths on the cache root, seccomp `@system-service` minus
 {aio,keyring,memlock,setuid,timer}, zero capabilities (root kept only as
 stable cache owner identity), SocketBind pinned to the single port (outbound
 connect/DNS unaffected, no IP egress pinning since upstream fetch is the
-job), MemoryMax 512M / TasksMax 512 / LimitNOFILE 16384, full kernel/proc/
+job: never add `IPAddressDeny`/`IPAddressAllow` to the unit, they filter
+both directions on the cgroup and an allow-list of loopback turns every
+upstream dial into `dial tcp ...: i/o timeout`), MemoryMax 512M /
+TasksMax 512 / LimitNOFILE 16384, full kernel/proc/
 keyring/namespace protection. The host side owns ingress (caddy vhost +
 listen IP, see ../nixos/server/all/go-mod-proxy01.nix).
 
