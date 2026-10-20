@@ -171,9 +171,11 @@ listen IP, see ../nixos/server/all/go-mod-proxy01.nix).
 
 `make deploy-test-nix` rolls a locally built binary onto the NixOS hosts:
 it backs up the current `/nix/persist/root/bin/goproxy` to `.old` (keeping
-the previous `.old2`), stops/restarts the `goproxy1` and `goproxy2` units and
-replaces the binary in place. `sudo -v` runs first so the later steps do not
-prompt mid-deploy.
+the previous `.old2`), stops/restarts the `go-mod-proxy01` and
+`go-mod-proxy02` units and replaces the binary in place. Both units are
+stopped before the swap; `go-mod-proxy02` starts first so the fleet keeps a
+warm cache online while `go-mod-proxy01` comes back. `sudo -v` runs first so
+the later steps do not prompt mid-deploy.
 
 `systemd-socket.nix` is the alternative on-demand fragment: a socket unit
 owns `127.0.0.1:9091` and passes the descriptor via LISTEN_FDS

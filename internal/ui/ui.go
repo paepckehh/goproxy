@@ -134,15 +134,18 @@ func (h *Handler) historyData(name string) (historyPayload, error) {
 	spec := historyRanges[name]
 	res := historyPayload{Range: name, ResolutionSec: int64(spec.res.Seconds())}
 
-	to := time.Now().UTC()
-	from := to.Add(-spec.span)
+	now := time.Now().UTC()
+	// Buckets are minute-aligned and the range end is exclusive, so the
+	// in-progress minute only counts once it is rounded up to its end.
+	to := now.Truncate(time.Minute).Add(time.Minute)
+	from := now.Add(-spec.span)
 	if spec.span == 0 {
 		earliest, _, err := h.hist.Bounds()
 		if err != nil {
 			return historyPayload{}, err
 		}
 		if earliest.IsZero() {
-			earliest = to.Add(-24 * time.Hour)
+			earliest = now.Add(-24 * time.Hour)
 		}
 		from = earliest
 	}

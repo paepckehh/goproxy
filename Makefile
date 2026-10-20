@@ -26,11 +26,11 @@ deploy-test-nix: update build
 	sudo touch /nix/persist/root/bin/$(PROJECT).old || true
 	sudo cp -af /nix/persist/root/bin/$(PROJECT).old /nix/persist/root/bin/$(PROJECT).old2 || true 
 	sudo cp -af /nix/persist/root/bin/$(PROJECT)-pilot /nix/persist/root/bin/$(PROJECT).old || true 
-	sudo systemctl stop $(PROJECT)1.service || true
-	sudo systemctl stop $(PROJECT)2.service || true
+	sudo systemctl stop go-mod-proxy01.service || true
+	sudo systemctl stop go-mod-proxy02.service || true
 	sudo cp -af ./$(PROJECT) /nix/persist/root/bin/$(PROJECT)
-	sudo systemctl start $(PROJECT)1.service
-	sudo systemctl start $(PROJECT)2.service
+	sudo systemctl start go-mod-proxy02.service
+	sudo systemctl start go-mod-proxy01.service
 
 deps:
 	rm -rf go.mod go.sum
