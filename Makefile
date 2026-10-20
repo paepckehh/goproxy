@@ -22,13 +22,15 @@ push: update
 deploy-test-nix: update build 
 	sudo -v
 	sudo mkdir -p /nix/persist/bin || true
-	sudo touch /nix/persist/root/bin/$(PROJECT)-pilot || true
-	sudo touch /nix/persist/root/bin/$(PROJECT)-pilot.old || true
-	sudo cp -af /nix/persist/root/bin/$(PROJECT)-pilot.old /nix/persist/root/bin/$(PROJECT)-pilot.old2 || true 
-	sudo cp -af /nix/persist/root/bin/$(PROJECT)-pilot /nix/persist/root/bin/$(PROJECT)-pilot.old || true 
-	sudo systemctl stop $(PROJECT)3.service || true
-	sudo cp -af ./$(PROJECT) /nix/persist/root/bin/$(PROJECT)-pilot
-	sudo systemctl start $(PROJECT)3.service
+	sudo touch /nix/persist/root/bin/$(PROJECT) || true
+	sudo touch /nix/persist/root/bin/$(PROJECT).old || true
+	sudo cp -af /nix/persist/root/bin/$(PROJECT).old /nix/persist/root/bin/$(PROJECT).old2 || true 
+	sudo cp -af /nix/persist/root/bin/$(PROJECT)-pilot /nix/persist/root/bin/$(PROJECT).old || true 
+	sudo systemctl stop $(PROJECT)1.service || true
+	sudo systemctl stop $(PROJECT)2.service || true
+	sudo cp -af ./$(PROJECT) /nix/persist/root/bin/$(PROJECT)
+	sudo systemctl start $(PROJECT)1.service
+	sudo systemctl start $(PROJECT)2.service
 
 deps:
 	rm -rf go.mod go.sum
