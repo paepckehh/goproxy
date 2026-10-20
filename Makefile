@@ -51,6 +51,9 @@ test:
 test-e2e:
 	GOPROXY_E2E=1 CGO_ENABLED=1 go test -race -count=1 -run E2E ./internal/proxy ./cmd/goproxy
 
+screenshots:
+	GOPROXY_SCREENSHOTS=1 go test ./internal/ui -run TestScreenshots -count=1 -v -timeout 5m
+
 cloc:
 	go run github.com/boyter/scc/v4@latest
 

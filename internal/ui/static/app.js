@@ -688,6 +688,20 @@ function applyStore(payload) {
   renderClients(payload.clients);
   renderNeighbours(payload.neighbours);
   if (state.stats) renderKPIs(state.stats, state.store);
+  scrollToHash();
+}
+
+// Deep links (#clients, #prewarm, #history) land after the pushed state
+// settles, so expanding tables do not leave the viewport on the wrong card.
+let hashEpoch = 0;
+function scrollToHash() {
+  if (!location.hash) return;
+  const epoch = ++hashEpoch;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (epoch !== hashEpoch) return;
+    const el = document.getElementById(location.hash.slice(1));
+    if (el) el.scrollIntoView({ block: "start" });
+  }));
 }
 
 // Most requested modules: the 25 hottest by requests served, reconciled in
@@ -787,6 +801,7 @@ function applyPrewarm(report) {
   if (!report) return;
   state.prewarm = report;
   renderPrewarm(report);
+  scrollToHash();
 }
 
 function renderPrewarm(r) {
@@ -877,6 +892,7 @@ function renderNeighbours(list) {
   for (const [url, tr] of rows) {
     if (!seen.has(url)) tr.remove();
   }
+  scrollToHash();
 }
 
 function updateNeighbourRow(tr, peer) {

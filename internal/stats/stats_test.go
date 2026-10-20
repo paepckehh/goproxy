@@ -408,3 +408,22 @@ func TestStats_SubscriberOverflowDoesNotBlock(t *testing.T) {
 		t.Errorf("buffered events = %d, want at most %d", len(ch), subscriberBuffer)
 	}
 }
+
+func TestStats_PrewarmFormatsBandwidth(t *testing.T) {
+	t.Parallel()
+	s := New(nil)
+	s.Prewarm(100, 12, 1, 3<<30, 1<<30)
+	ev := <-s.evCh
+	if !strings.Contains(ev.Detail, "4.0 GiB pulled") {
+		t.Errorf("prewarm detail = %q, want a human-readable bandwidth", ev.Detail)
+	}
+}
+
+func TestStats_WithStartedAt(t *testing.T) {
+	t.Parallel()
+	start := time.Now().Add(-3 * time.Hour).UTC()
+	s := New(nil, WithStartedAt(start))
+	if !s.started.Equal(start) {
+		t.Errorf("started = %v, want %v", s.started, start)
+	}
+}

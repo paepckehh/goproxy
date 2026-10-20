@@ -180,6 +180,17 @@ func WithFlushInterval(d time.Duration) Option {
 	}
 }
 
+// WithStartedAt overrides the process start time reported as uptime.
+// Embeddings and screenshot fixtures use it to show a stable, realistic
+// uptime instead of the seconds since the collector was created.
+func WithStartedAt(t time.Time) Option {
+	return func(s *Stats) {
+		if !t.IsZero() {
+			s.started = t.UTC()
+		}
+	}
+}
+
 // New creates a collector. rec persists lifetime totals, one history
 // bucket per minute and the event log; nil disables persistence (counters
 // and the feed stay in memory only).
@@ -487,8 +498,8 @@ func (s *Stats) Indexed(modules int) {
 func (s *Stats) Prewarm(modules, fetched, failed int, upstreamBytes, peerBytes int64) {
 	s.bytesUp.Add(upstreamBytes)
 	s.bytesNeighbour.Add(peerBytes)
-	detail := fmt.Sprintf("fleet sync: %d hottest modules, %d fetched, %d bytes pulled",
-		modules, fetched, upstreamBytes+peerBytes)
+	detail := fmt.Sprintf("fleet sync: %d hottest modules, %d fetched, %s pulled",
+		modules, fetched, humanBytes(upstreamBytes+peerBytes))
 	if failed > 0 {
 		detail += fmt.Sprintf(", %d failed", failed)
 	}
@@ -505,6 +516,21 @@ func verifiedText(v bool) string {
 		return "verified against checksum db"
 	}
 	return "unverified: not in checksum db"
+}
+
+// humanBytes renders a byte count for the event feed, where the dashboard
+// has no structured byte field to format itself.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // trimEvent keeps hostile request paths from turning the in-memory feed or

@@ -146,11 +146,13 @@ header {
 
 .kpis {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(205px, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 15px;
   margin-bottom: 18px;
   perspective: 1400px;
 }
+@media (max-width: 1040px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px) { .kpis { grid-template-columns: 1fr; } }
 
 .card {
   position: relative;
