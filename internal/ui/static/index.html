@@ -63,6 +63,11 @@
       <span class="sub" id="kpi-store-sub">—</span>
     </div>
     <div class="card kpi" style="--i:6">
+      <span class="label">Process memory</span>
+      <span class="value" id="kpi-mem">0 B</span>
+      <span class="sub" id="kpi-mem-sub">—</span>
+    </div>
+    <div class="card kpi" style="--i:7">
       <span class="label">Neighbour cache</span>
       <span class="value" id="kpi-neighbour">0</span>
       <span class="sub" id="kpi-neighbour-sub">—</span>
@@ -96,6 +101,35 @@
         <tbody id="popular-body"></tbody>
       </table>
       <div class="empty" id="popular-empty">no requests yet — run a build through the proxy</div>
+    </div>
+  </section>
+
+  <section class="clients">
+    <div class="card table-card">
+      <div class="card-head">
+        <h2>Top clients by requests</h2>
+        <span class="hint" id="clients-req-hint"></span>
+      </div>
+      <table>
+        <thead><tr>
+          <th>client</th><th class="r">requests</th><th class="r">served</th><th>last seen</th>
+        </tr></thead>
+        <tbody id="clients-req-body"></tbody>
+      </table>
+      <div class="empty" id="clients-req-empty">no client traffic yet — rankings come from the in-memory counters</div>
+    </div>
+    <div class="card table-card">
+      <div class="card-head">
+        <h2>Top clients by bandwidth</h2>
+        <span class="hint" id="clients-bytes-hint"></span>
+      </div>
+      <table>
+        <thead><tr>
+          <th>client</th><th class="r">served</th><th class="r">requests</th><th>last seen</th>
+        </tr></thead>
+        <tbody id="clients-bytes-body"></tbody>
+      </table>
+      <div class="empty" id="clients-bytes-empty">no client traffic yet</div>
     </div>
   </section>
 
@@ -191,7 +225,7 @@
 
 <footer>
   <span><b>Long-term archive.</b> Modules are stored as received, never expire, and are served from disk; the cloud upstream is contacted only on a cold miss.</span>
-  <span>History, cache state and served bandwidth persist in SQLite.</span>
+  <span>History, cache state, served bandwidth and client rankings persist in SQLite; the nightly window at 23:00 compacts, verifies and archives the database.</span>
 </footer>
 
 <script src="/static/app.js" defer></script>

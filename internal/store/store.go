@@ -338,6 +338,17 @@ func (s *Store) Modules() []ModStat {
 	return out
 }
 
+// TopServed returns up to limit module aggregates ordered by bytes served,
+// the ranking behind the dashboard's archived-modules table. Modules already
+// arrives sorted by served bytes, so this only truncates.
+func (s *Store) TopServed(limit int) []ModStat {
+	mods := s.Modules()
+	if limit >= 0 && len(mods) > limit {
+		mods = mods[:limit]
+	}
+	return mods
+}
+
 // TopRequests returns up to limit module aggregates ordered by served
 // requests, the ranking behind the dashboard's most-requested table and the
 // hourly cache sync. Ties fall back to bytes served, then to the path, for a

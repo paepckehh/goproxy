@@ -19,10 +19,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
 
+	"paepcke.de/goproxy/internal/clients"
 	"paepcke.de/goproxy/internal/stats"
 	"paepcke.de/goproxy/internal/store"
 )
@@ -40,7 +42,13 @@ const (
 // so the recorder and the dashboard API never contend.
 type DB struct {
 	db            *sql.DB
+	path          string
 	pruneInterval time.Duration
+
+	// mu serializes the nightly maintenance window (Lock) with every
+	// recorder write and dashboard read (RLock): VACUUM and the snapshot
+	// never race a flush, and no write is lost to a busy database.
+	mu sync.RWMutex
 }
 
 // Open creates or opens the database at path with WAL journaling.
@@ -61,7 +69,7 @@ func Open(path string) (*DB, error) {
 		db.Close()
 		return nil, err
 	}
-	return &DB{db: db, pruneInterval: pruneInterval}, nil
+	return &DB{db: db, path: path, pruneInterval: pruneInterval}, nil
 }
 
 func migrate(db *sql.DB) error {
@@ -120,6 +128,14 @@ func migrate(db *sql.DB) error {
 			served_bytes INTEGER NOT NULL DEFAULT 0,
 			last_used INTEGER NOT NULL DEFAULT 0
 		)`,
+		`CREATE TABLE IF NOT EXISTS clients (
+			id TEXT PRIMARY KEY,
+			requests INTEGER NOT NULL DEFAULT 0,
+			bytes_down INTEGER NOT NULL DEFAULT 0,
+			last_seen INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS clients_requests ON clients (requests DESC)`,
+		`CREATE INDEX IF NOT EXISTS clients_bytes ON clients (bytes_down DESC)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("history: migrate: %w", err)
@@ -183,6 +199,8 @@ func ensureColumns(db *sql.DB, table string, cols []struct{ name, decl string })
 
 // Close checkpoints the WAL and closes the database.
 func (d *DB) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	_, _ = d.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`) // best effort
 	return d.db.Close()
 }
@@ -206,11 +224,15 @@ func (d *DB) Run(ctx context.Context) {
 
 // prune deletes events older than the retention window.
 func (d *DB) prune(now time.Time) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	_, _ = d.db.Exec(`DELETE FROM events WHERE time < ?`, now.Add(-eventRetention).Unix())
 }
 
 // SaveTotals upserts the lifetime counters (stats.Recorder).
 func (d *DB) SaveTotals(t stats.Totals) error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	return saveTotalsTx(d.db, t)
 }
 
@@ -236,6 +258,8 @@ func saveTotalsTx(tx interface {
 
 // LoadTotals returns the persisted lifetime counters.
 func (d *DB) LoadTotals() (stats.Totals, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	var t stats.Totals
 	err := d.db.QueryRow(`SELECT requests, hits, misses, passes,
 			verifications, verify_failures, bytes_down, bytes_up, bytes_saved,
@@ -255,6 +279,8 @@ func (d *DB) LoadTotals() (stats.Totals, error) {
 // written, so a later restart restores the lifetime served bandwidth the
 // dashboard's top-modules chart shows.
 func (d *DB) SaveModuleUsage(usage map[string]store.ModuleUsage) error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	if len(usage) == 0 {
 		return nil
 	}
@@ -290,6 +316,8 @@ func (d *DB) SaveModuleUsage(usage map[string]store.ModuleUsage) error {
 
 // LoadModuleUsage returns the persisted per-module access counters.
 func (d *DB) LoadModuleUsage() (map[string]store.ModuleUsage, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	rows, err := d.db.Query(`SELECT path, requests, served_bytes, last_used FROM module_usage`)
 	if err != nil {
 		return nil, fmt.Errorf("history: module usage: %w", err)
@@ -314,10 +342,80 @@ func (d *DB) LoadModuleUsage() (map[string]store.ModuleUsage, error) {
 	return usage, nil
 }
 
+// SaveClients upserts per-client access counters. Absolute values are
+// written, so a restart restores the long-term client ranking.
+func (d *DB) SaveClients(usage map[string]clients.Usage) error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if len(usage) == 0 {
+		return nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("history: clients: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT INTO clients (id, requests, bytes_down, last_seen)
+		VALUES (?,?,?,?)
+		ON CONFLICT (id) DO UPDATE SET
+			requests = excluded.requests,
+			bytes_down = excluded.bytes_down,
+			last_seen = excluded.last_seen`)
+	if err != nil {
+		return fmt.Errorf("history: clients: %w", err)
+	}
+	defer stmt.Close()
+	for id, u := range usage {
+		var lastSeen int64
+		if !u.LastSeen.IsZero() {
+			lastSeen = u.LastSeen.Unix()
+		}
+		if _, err := stmt.Exec(id, u.Requests, u.BytesDown, lastSeen); err != nil {
+			return fmt.Errorf("history: clients: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("history: clients: %w", err)
+	}
+	return nil
+}
+
+// LoadClients returns the most active persisted clients, bounded so a long
+// history of addresses never inflates the in-memory table at startup.
+func (d *DB) LoadClients(limit int) (map[string]clients.Usage, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	rows, err := d.db.Query(`SELECT id, requests, bytes_down, last_seen
+		FROM clients ORDER BY requests DESC, bytes_down DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("history: clients: %w", err)
+	}
+	defer rows.Close()
+	usage := make(map[string]clients.Usage)
+	for rows.Next() {
+		var id string
+		var u clients.Usage
+		var lastSeen int64
+		if err := rows.Scan(&id, &u.Requests, &u.BytesDown, &lastSeen); err != nil {
+			return nil, fmt.Errorf("history: clients: %w", err)
+		}
+		if lastSeen != 0 {
+			u.LastSeen = time.Unix(lastSeen, 0).UTC()
+		}
+		usage[id] = u
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("history: clients: %w", err)
+	}
+	return usage, nil
+}
+
 // RecordBucket upserts one minute of activity (stats.Recorder): counter
 // deltas merge when several flushes land in the same minute, store size
 // snapshots overwrite (last sample wins).
 func (d *DB) RecordBucket(b stats.Bucket) error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	key := b.Bucket.Truncate(time.Minute).Unix()
 	_, err := d.db.Exec(`INSERT INTO buckets (
 			bucket, requests, hits, misses, passes,
@@ -358,6 +456,8 @@ func (d *DB) RecordBucket(b stats.Bucket) error {
 // event of the batch lands, or none does, so failed batches can be retried
 // without duplicates.
 func (d *DB) AppendEvents(evs []stats.Event) error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	if len(evs) == 0 {
 		return nil
 	}
@@ -399,6 +499,8 @@ func appendEventsTx(tx *sql.Tx, evs []stats.Event) error {
 
 // RecentEvents returns up to n events, newest first.
 func (d *DB) RecentEvents(n int) ([]stats.Event, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	if n <= 0 {
 		return nil, nil
 	}
@@ -446,6 +548,8 @@ type Point struct {
 // (exclusive) into slots of res. res below one minute is clamped to one
 // minute; empty slots are skipped, points are time-keyed and ordered.
 func (d *DB) Series(from, to time.Time, res time.Duration) ([]Point, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	stride := int64(res.Seconds())
 	if stride < 60 {
 		stride = 60
@@ -502,6 +606,8 @@ type Summary struct {
 // RangeSummary aggregates the buckets between from (inclusive) and to
 // (exclusive), plus the first and last observed cache-store sizes.
 func (d *DB) RangeSummary(from, to time.Time) (Summary, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	var s Summary
 	var first, last sql.NullInt64
 	err := d.db.QueryRow(`SELECT
@@ -536,6 +642,8 @@ func (d *DB) RangeSummary(from, to time.Time) (Summary, error) {
 // Bounds returns the earliest and latest bucket times. Both are the zero
 // time when no buckets exist yet.
 func (d *DB) Bounds() (from, to time.Time, err error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	var minS, maxS sql.NullInt64
 	err = d.db.QueryRow(`SELECT MIN(bucket), MAX(bucket) FROM buckets`).
 		Scan(&minS, &maxS)

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"paepcke.de/goproxy/internal/clients"
 	"paepcke.de/goproxy/internal/stats"
 	"paepcke.de/goproxy/internal/store"
 )
@@ -645,5 +646,45 @@ func TestHistory_MigratesLegacySchema(t *testing.T) {
 	}
 	if len(pts) != 1 || pts[0].Requests != 3 || pts[0].BytesNeighbour != 0 {
 		t.Errorf("series after upgrade = %+v", pts)
+	}
+}
+
+func TestHistory_ClientUsageRoundtrip(t *testing.T) {
+	t.Parallel()
+	db := open(t)
+
+	want := map[string]clients.Usage{
+		"10.0.0.1": {Requests: 4, BytesDown: 2048, LastSeen: time.Unix(1700000000, 0).UTC()},
+		"10.0.0.2": {Requests: 9, BytesDown: 9000},
+	}
+	if err := db.SaveClients(want); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveClients(map[string]clients.Usage{
+		"10.0.0.1": {Requests: 5, BytesDown: 3000, LastSeen: time.Unix(1700000100, 0).UTC()},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.LoadClients(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("clients = %+v, want 2", got)
+	}
+	if u := got["10.0.0.1"]; u.Requests != 5 || u.BytesDown != 3000 ||
+		!u.LastSeen.Equal(time.Unix(1700000100, 0)) {
+		t.Errorf("client 1 = %+v, want upserted counters", u)
+	}
+	if u := got["10.0.0.2"]; u.Requests != 9 || u.BytesDown != 9000 || !u.LastSeen.IsZero() {
+		t.Errorf("client 2 = %+v, want untouched counters", u)
+	}
+	// The limit returns the busiest clients only.
+	top, err := db.LoadClients(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(top) != 1 || top["10.0.0.2"].Requests != 9 {
+		t.Errorf("limited clients = %+v, want only the busiest", top)
 	}
 }

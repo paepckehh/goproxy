@@ -13,14 +13,18 @@ policy churn.
   NEIGHBOUR_CACHES (parallel peer lookup before the upstream)
 - secure: validates upstream signatures
 - cool: modern 3D animated business-like dashboard about packages, sources,
-  cache hits/misses, the 25 most requested modules, neighbour-cache hits and
+  cache hits/misses, the 25 most requested modules, top 10 clients by
+  requests and by bandwidth, process memory (RSS, Go heap, goroutines)
+  against the systemd cgroup limit, neighbour-cache hits and
   peer bandwidth, live neighbour-cache health (online state, version,
   latency), pre-cache sync details, upstream and downstream bandwidth used
   and saved, store size, plus long-term (24h to all-time) history charts
 - persistent: long-term stats in the SQLite stats database via the pure-Go
   cgo-free driver `modernc.org/sqlite`; lifetime counters, per-module
-  served-bandwidth totals, minute-resolution
-  buckets and the event log all survive reboots
+  served-bandwidth totals, per-client request/bandwidth rankings,
+  minute-resolution buckets and the event log all survive reboots; a nightly
+  23:00 local window checks, compacts, verifies and archives the database
+  into eight gzip generations
 
 KEEP ALWAYS AGENTS.md and README.md up-to-date for correct documentation.
 
@@ -31,8 +35,11 @@ cmd/goproxy          entrypoint: flags, env wiring, socket activation, idle exit
                      graceful shutdown
 internal/store       disk cache (standard download/ layout) + in-memory index
 internal/sumdb       checksum-database verification (x/mod sumdb client)
-internal/stats       lock-free counters, event ring, traffic buckets, recorder flush loop
-internal/history      long-term stats in SQLite (pure-Go driver, WAL, minute buckets)
+internal/stats       lock-free counters, event ring, traffic buckets, process
+                     memory sampling, recorder flush loop
+internal/history     long-term stats in SQLite (pure-Go driver, WAL, minute
+                     buckets, clients table, nightly check/compaction/backup)
+internal/clients     bounded in-memory per-client request/bandwidth ranking
 internal/proxy       GOPROXY protocol handlers (singleflight, neighbour-first
                      fetch, verify, cache; fetches detached from client contexts);
                      hourly fleet prewarm of the hottest modules
@@ -60,15 +67,22 @@ lifetime totals table, one
 bucket per minute (requests/hits/misses/bytes + store-size snapshots, kept
 forever), per-module access counters (requests/bytes served/last use,
 flushed every 30s so the cache table and top-modules bandwidth chart keep
-their totals across restarts) and the event log (pruned after 90d). The
+their totals across restarts), per-client counters (requests/bytes/last
+seen, keyed by X-Forwarded-For or socket address, bounded to 4096 entries
+in memory, flushed every 30s and pruned after 90d), and the event log
+(pruned after 90d). The
 dashboard is driven
 entirely by one Server-Sent Events stream (`/api/events?range=`): it seeds
-the event ring, counters, cache table, most-requested list, pre-cache report
+the event ring, counters, cache table, most-requested list, client
+rankings, pre-cache report
 and the selected history series on connect, then pushes each new event, the
-counters every 2s, the cache table and most-requested list only when they
+counters every 2s, the cache table, most-requested list and both client
+rankings only when they
 changed (no idle table reloads), the pre-cache report only when a pass
 finished, the history series every 30s, and a `tick` every 25s. Sections run
-top to bottom: KPIs, 3D top-modules chart, 25 most requested modules,
+top to bottom: KPIs (including process RSS/heap/goroutines against the
+cgroup limit), 3D top-modules chart, 25 most requested modules,
+top clients by requests and by bandwidth,
 neighbour caches, pre-cache sync, long-term history, archived modules plus
 events, and the traffic chart last. A non-blocking fan-out keeps a slow client
 from stalling the collector. The page is push-only: it never fetches
@@ -84,6 +98,26 @@ pills in the dashboard header (`persistErrors`, dropped events) and never
 degrade proxying. Legacy pre-SQLite
 `stats.json` snapshots migrate into `stats.db` on first start (renamed to
 `stats.json.imported`).
+
+Nightly maintenance: at 23:00 local time a goroutine (cmd/goproxy
+maintenance.go) runs `history.DB.Nightly` without restarting or pausing
+serving: semantic check (`PRAGMA quick_check`, present totals row,
+non-negative counters, no future-dated events/clients, lifetime requests
+never behind bucket history), event/client pruning, `wal_checkpoint
+(TRUNCATE)`, `VACUUM` + `ANALYZE` + `PRAGMA optimize`, a `VACUUM INTO`
+snapshot built under a temporary name, verified read-only/immutable with
+`quick_check`, renamed into place, gzip compression
+(temp file + rename, original removed only after success), and an
+eight-generation cycle in `<db>.backup.daily` (newest two always kept).
+The window closes with a final WAL checkpoint so the live file rests
+complete and the WAL empty; results are logged and pushed as a
+`maintenance` event. A start after a missed window catches up once after
+five minutes. The single SQLite connection serializes the window with the
+recorder. The dashboard reads the client rankings and the history series
+from memory (client table + 20s series cache); only the flush loop and the
+nightly window touch the database. The process memory card samples
+`/proc/self/status` RSS, Go heap and goroutines at most once per second and
+shows the cgroup `MemoryMax` ceiling systemd installed.
 
 Observability: the journal stays quiet by default. Per-request access
 lines and routine failure detail (upstream dial errors, non-200 statuses,
@@ -184,7 +218,8 @@ wiping the cache leaves the history intact (an unprivileged fallback stored
 next to the cache is lost with it). The module cache root
 itself is `-root` flag > `CACHE_ROOT` env (dedicated path/disk for module
 storage) > `cache`. The legacy `stats.json` lookup follows the database
-directory.
+directory. Nightly archives live in `<db>.backup.daily/` beside it, so a
+cache wipe and a history restore stay independent.
 
 ## Releases
 

@@ -10,8 +10,10 @@ import (
 	"io/fs"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"paepcke.de/goproxy/internal/clients"
 	"paepcke.de/goproxy/internal/fleet"
 	"paepcke.de/goproxy/internal/history"
 	"paepcke.de/goproxy/internal/stats"
@@ -24,10 +26,16 @@ var staticFS embed.FS
 const (
 	stateInterval     = 2 * time.Second  // live dashboard push cadence
 	historyInterval   = 30 * time.Second // long-term series refresh
+	historyCacheTTL   = 20 * time.Second // shared aggregation cache
 	keepaliveInterval = 25 * time.Second
 
 	// popularLimit is how many modules the most-requested table shows.
 	popularLimit = 25
+	// clientLimit is how many clients each ranking shows.
+	clientLimit = 10
+	// moduleTableLimit bounds the archived-modules table pushed on every
+	// state tick; the page shows the top 10 by served bandwidth.
+	moduleTableLimit = 25
 )
 
 // historyRange is one selectable dashboard history window. Aggregates
@@ -45,6 +53,15 @@ var historyRanges = map[string]historyRange{
 	"all": {span: 0, res: 24 * time.Hour}, // from the first recorded bucket
 }
 
+// clientPayload is the live top-client ranking. Both rankings are computed
+// from the in-memory tracker; the dashboard never queries the database for
+// them.
+type clientPayload struct {
+	Tracked    int            `json:"tracked"`
+	ByRequests []clients.Stat `json:"byRequests"`
+	ByBytes    []clients.Stat `json:"byBytes"`
+}
+
 // dashboardPayload is the one-shot dashboard state for scripts and
 // health probes; the dashboard page itself only consumes the SSE stream.
 type dashboardPayload struct {
@@ -53,18 +70,20 @@ type dashboardPayload struct {
 	Store      store.Summary    `json:"store"`
 	Modules    []store.ModStat  `json:"modules"`
 	Popular    []store.ModStat  `json:"popular"`
+	Clients    clientPayload    `json:"clients"`
 	Neighbours []fleet.Status   `json:"neighbours"`
 	Prewarm    fleet.WarmReport `json:"prewarm"`
 }
 
 // statePayload is the cache half of a live dashboard push: the store
-// summary, the module table, the neighbour fleet status and the running
-// version.
+// summary, the module table, the client ranking, the neighbour fleet
+// status and the running version.
 type statePayload struct {
 	Version    string          `json:"version"`
 	Store      store.Summary   `json:"store"`
 	Modules    []store.ModStat `json:"modules"`
 	Popular    []store.ModStat `json:"popular"`
+	Clients    clientPayload   `json:"clients"`
 	Neighbours []fleet.Status  `json:"neighbours"`
 }
 
@@ -96,16 +115,41 @@ type Handler struct {
 	stats   *stats.Stats
 	store   *store.Store
 	hist    *history.DB
+	clients *clients.Tracker
 	version string
 	peers   PeerSource
 	prewarm PrewarmSource
+
+	histMu    sync.Mutex
+	histCache map[string]histEntry
+}
+
+// histEntry caches one aggregated history series. Several open dashboards
+// would otherwise run the same SQL aggregation on every push; a short TTL
+// shares one result without making the series visibly stale.
+type histEntry struct {
+	at time.Time
+	p  historyPayload
 }
 
 // New creates the dashboard handler. peers reports the neighbour cache
 // health and prewarm the last fleet cache sync; nil means this proxy is
-// standalone or no sync has run yet.
-func New(m *stats.Stats, s *store.Store, h *history.DB, version string, peers PeerSource, prewarm PrewarmSource) *Handler {
-	return &Handler{stats: m, store: s, hist: h, version: version, peers: peers, prewarm: prewarm}
+// standalone or no sync has run yet. c may be nil, in which case the client
+// ranking stays empty.
+func New(m *stats.Stats, s *store.Store, h *history.DB, c *clients.Tracker, version string, peers PeerSource, prewarm PrewarmSource) *Handler {
+	return &Handler{stats: m, store: s, hist: h, clients: c, version: version, peers: peers, prewarm: prewarm}
+}
+
+// clientState renders the in-memory top-client rankings.
+func (h *Handler) clientState() clientPayload {
+	if h.clients == nil {
+		return clientPayload{}
+	}
+	return clientPayload{
+		Tracked:    h.clients.Count(),
+		ByRequests: h.clients.TopByRequests(clientLimit),
+		ByBytes:    h.clients.TopByBytes(clientLimit),
+	}
 }
 
 // neighbours returns the current fleet status, if any.
@@ -157,6 +201,7 @@ func (h *Handler) state() dashboardPayload {
 		Store:      h.store.Summary(),
 		Modules:    h.store.Modules(),
 		Popular:    h.store.TopRequests(popularLimit),
+		Clients:    h.clientState(),
 		Neighbours: h.neighbours(),
 		Prewarm:    h.prewarmReport(),
 	}
@@ -176,6 +221,28 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 // historyData aggregates one range into minute buckets of res. The caller
 // must have validated the range name against historyRanges.
 func (h *Handler) historyData(name string) (historyPayload, error) {
+	h.histMu.Lock()
+	if e, ok := h.histCache[name]; ok && time.Since(e.at) < historyCacheTTL {
+		h.histMu.Unlock()
+		return e.p, nil
+	}
+	h.histMu.Unlock()
+
+	res, err := h.aggregateHistory(name)
+	if err != nil {
+		return historyPayload{}, err
+	}
+	h.histMu.Lock()
+	if h.histCache == nil {
+		h.histCache = make(map[string]histEntry)
+	}
+	h.histCache[name] = histEntry{at: time.Now(), p: res}
+	h.histMu.Unlock()
+	return res, nil
+}
+
+// aggregateHistory builds one range from the minute buckets.
+func (h *Handler) aggregateHistory(name string) (historyPayload, error) {
 	spec := historyRanges[name]
 	res := historyPayload{Range: name, ResolutionSec: int64(spec.res.Seconds())}
 
@@ -229,9 +296,7 @@ func (h *Handler) history(w http.ResponseWriter, r *http.Request) {
 // statsState renders the live counters without the event ring: events
 // travel as individual messages on the same stream.
 func (h *Handler) statsState() ([]byte, error) {
-	snap := h.stats.Snapshot()
-	snap.Events = nil
-	return json.Marshal(snap)
+	return json.Marshal(h.stats.Counters())
 }
 
 // storeState renders the cache summary, module tables and fleet status.
@@ -239,8 +304,9 @@ func (h *Handler) storeState() ([]byte, error) {
 	return json.Marshal(statePayload{
 		Version:    h.version,
 		Store:      h.store.Summary(),
-		Modules:    h.store.Modules(),
+		Modules:    h.store.TopServed(moduleTableLimit),
 		Popular:    h.store.TopRequests(popularLimit),
+		Clients:    h.clientState(),
 		Neighbours: h.neighbours(),
 	})
 }

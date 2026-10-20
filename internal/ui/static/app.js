@@ -112,6 +112,17 @@ function renderKPIs(s, store) {
   $("kpi-store-sub").textContent =
     fmtNum(store.modules) + " modules · " + fmtNum(store.versions) + " versions · " + fmtNum(store.files) + " files";
 
+  // Process memory against the cgroup ceiling systemd's hardening set.
+  const mem = s.memory || {};
+  const rss = mem.rssBytes || 0;
+  countUp("kpi-mem", rss, fmtBytes);
+  let memSub = fmtBytes(mem.heapAllocBytes || 0) + " heap · " + (mem.goroutines || 0) + " goroutines";
+  if (mem.limitBytes > 0) {
+    const pct = Math.round((100 * rss) / mem.limitBytes);
+    memSub += " · " + pct + "% of " + fmtBytes(mem.limitBytes) + " limit";
+  }
+  $("kpi-mem-sub").textContent = memSub;
+
   countUp("kpi-neighbour", L.neighbourHits, fmtNum);
   $("kpi-neighbour-sub").textContent = neighbourSub(L, state.neighbours);
 }
@@ -211,6 +222,7 @@ function eventChip(result) {
     case "miss": return '<span class="chip warn">miss</span>';
     case "pass": return '<span class="chip ok">pass</span>';
     case "neighbour": return '<span class="chip nb">neighbour</span>';
+    case "maintenance": return '<span class="chip nb">maintenance</span>';
     case "verify-failed": return '<span class="chip bad">tampered</span>';
     case "error": return '<span class="chip bad">error</span>';
     case "upstream": return '<span class="chip bad">upstream</span>';
@@ -673,6 +685,7 @@ function applyStore(payload) {
     chart3d.setData(payload.modules);
   }
   renderPopular(payload.popular);
+  renderClients(payload.clients);
   renderNeighbours(payload.neighbours);
   if (state.stats) renderKPIs(state.stats, state.store);
 }
@@ -711,6 +724,53 @@ function renderPopular(list) {
   }
   $("popular-empty").style.display = state.popular.length ? "none" : "";
   refreshAges();
+}
+
+// Top clients: two rankings from the in-memory tracker, reconciled in
+// place exactly like the module tables.
+function renderClients(payload) {
+  const p = payload || {};
+  renderClientTable("clients-req-body", "clients-req-empty", "clients-req-hint",
+    p.byRequests, "requests", "top 10 by requests · " + (p.tracked || 0) + " tracked");
+  renderClientTable("clients-bytes-body", "clients-bytes-empty", "clients-bytes-hint",
+    p.byBytes, "bytes", "top 10 by downstream bandwidth");
+}
+
+function renderClientTable(bodyId, emptyId, hintId, list, primary, hint) {
+  const body = $(bodyId);
+  if (!body) return;
+  const clients = Array.isArray(list) ? list : [];
+  $(emptyId).style.display = clients.length ? "none" : "block";
+  $(hintId).textContent = clients.length ? hint : "";
+  const rows = new Map();
+  for (const tr of body.children) rows.set(tr.dataset.id, tr);
+  const seen = new Set();
+  for (const c of clients) {
+    seen.add(c.id);
+    let tr = rows.get(c.id);
+    if (!tr) {
+      tr = document.createElement("tr");
+      tr.dataset.id = c.id;
+      tr.innerHTML = `<td><span class="path"></span></td><td class="r"></td>
+        <td class="r"></td><td class="dim" data-time=""></td>`;
+      body.appendChild(tr);
+    }
+    const cells = tr.children;
+    cells[0].firstChild.textContent = c.id;
+    if (primary === "requests") {
+      cells[1].textContent = fmtNum(c.requests);
+      cells[2].textContent = fmtBytes(c.bytesDown);
+    } else {
+      cells[1].textContent = fmtBytes(c.bytesDown);
+      cells[2].textContent = fmtNum(c.requests);
+    }
+    const used = c.lastSeen && !c.lastSeen.startsWith("0001") ? c.lastSeen : "";
+    cells[3].dataset.time = used;
+    cells[3].textContent = used ? ago(used) : "never";
+  }
+  for (const [id, tr] of rows) {
+    if (!seen.has(id)) tr.remove();
+  }
 }
 
 // Pre-cache sync: the last hourly pass with its summary and per-module
@@ -850,7 +910,7 @@ function parseSSE(msg) {
 // Relative timestamps age only when the server pushes; the stream's tick
 // keeps them fresh without a client-side timer or another request.
 function refreshAges() {
-  document.querySelectorAll("#events [data-time], #modules-body [data-time], #popular-body [data-time], #fleet-body [data-time], #prewarm-summary [data-time]").forEach((el) => {
+  document.querySelectorAll("#events [data-time], #modules-body [data-time], #popular-body [data-time], #clients-req-body [data-time], #clients-bytes-body [data-time], #fleet-body [data-time], #prewarm-summary [data-time]").forEach((el) => {
     el.textContent = el.dataset.time ? ago(el.dataset.time) : "never";
   });
 }

@@ -366,6 +366,15 @@ header {
 .fleet[hidden] { display: none; }
 
 .popular { margin-bottom: 18px; }
+
+.clients {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 15px;
+  margin-bottom: 18px;
+}
+@media (max-width: 980px) { .clients { grid-template-columns: 1fr; } }
+
 .prewarm { margin-bottom: 18px; }
 .prewarm-items {
   list-style: none;

@@ -46,8 +46,8 @@ Everything a fleet of build machines needs, in one dependency-free binary.
 | **Archival** | Long-term module storage, not a disposable cache: files never expire, are stored as received, and serve straight from disk without the cloud upstream. The standard `download/` tree is portable, backup-friendly and usable as a `file://` proxy source |
 | **Shared** | `NEIGHBOUR_CACHES` chains goproxy instances: a cache miss asks every peer in parallel (short header timeout), the first copy wins, the rest are cancelled, and only a full peer miss falls through to the upstream. Peers are probed at startup and every 10 minutes (status, version and latency on the dashboard), and the top 100 modules are re-warmed at startup and once per jittered hour |
 | **Secure** | Every `.zip` and `.mod` is hash-verified against the signed sum.golang.org checksum database: Ed25519 note signature, transparency-log tree consistency, and tile inclusion proofs. Tampered content is refused, never cached |
-| **Observable** | Embedded dashboard with zero external assets, pushed live over one SSE stream (counters, cache table, events, history): hit ratio, bandwidth saved, store usage, the 25 most requested modules, neighbour-cache health, pre-cache sync details, a 3D top-modules chart with a static side agenda linked by color (module names never rotate with the scene), live event feed, traffic, and 24h to all-time history charts |
-| **Persistent** | Lifetime counters, per-module served bandwidth (requests, bytes, last use), minute-resolution buckets and the event log survive restarts and reboots in SQLite (pure-Go driver, WAL journaling) |
+| **Observable** | Embedded dashboard with zero external assets, pushed live over one SSE stream (counters, cache table, clients, events, history): hit ratio, bandwidth saved, store usage, the 25 most requested modules, top 10 clients by requests and by bandwidth, process memory against the systemd cgroup limit, neighbour-cache health, pre-cache sync details, a 3D top-modules chart with a static side agenda linked by color (module names never rotate with the scene), live event feed, traffic, and 24h to all-time history charts |
+| **Persistent** | Lifetime counters, per-module served bandwidth (requests, bytes, last use), per-client request/bandwidth rankings, minute-resolution buckets and the event log survive restarts and reboots in SQLite (pure-Go driver, WAL journaling). A nightly 23:00 local-time window checks, compacts, verifies and archives the database into eight compressed generations |
 | **Deployable** | Socket activation with idle exit, hardened systemd units, NixOS modules, static cgo-free binary |
 | **Honest failure** | Checksum-database outages fail closed (a missing tile is an outage, not an unknown module); recorder errors surface as warning pills on the dashboard (`persistErrors`, dropped events) and never degrade proxying |
 
@@ -123,7 +123,7 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 | `GET /<module>/@v/<v>.zip` | cached, hash-verified against the checksum database; on a miss the neighbour caches are asked in parallel first |
 | `GET /sumdb/<db>/...` | forwarded verbatim to the configured database only (404 otherwise), with the `/supported` probe answered locally, so go clients run their full verification through the proxy |
 | `GET /` | operations dashboard (push-only: every update arrives over SSE; no fetching, polling or client-side timers) |
-| `GET /api/dashboard` | JSON snapshot for scripts and probes (the dashboard page does not use it); includes the 25 most requested modules, the neighbour-cache fleet status and the last pre-cache sync |
+| `GET /api/dashboard` | JSON snapshot for scripts and probes (the dashboard page does not use it); includes the 25 most requested modules, the top 10 clients by requests and by bandwidth, the process memory picture, the neighbour-cache fleet status and the last pre-cache sync |
 | `GET /api/events?range=24h` | Server-Sent Events stream: `events` seed, `store` cache table and most-requested list (only when changed), `prewarm` sync details (only when a pass finished), `stats` counters every 2s, `history` for the selected range every 30s, a `tick` every 25s that ages timestamps, and one `event` message per new proxy event |
 | `GET /api/history?range=24h` | long-term stats series (`24h`, `7d`, `30d`, `1y`, `all`) |
 | `GET /healthz` | liveness plus version |
@@ -149,8 +149,9 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 | `internal/store` | disk cache (standard `download/` layout) plus in-memory index |
 | `internal/sumdb` | checksum-database verification (`golang.org/x/mod/sumdb` client) |
 | `internal/proxy` | GOPROXY protocol handlers: singleflight, neighbour-first fetch, verify, cache; fetches detached from client contexts |
-| `internal/stats` | lock-free counters, event ring, traffic buckets, recorder flush loop |
-| `internal/history` | long-term stats in SQLite (pure-Go driver, WAL, minute buckets) |
+| `internal/stats` | lock-free counters, event ring, traffic buckets, process memory sampling, recorder flush loop |
+| `internal/history` | long-term stats in SQLite (pure-Go driver, WAL, minute buckets, nightly check/compaction/backup cycle) |
+| `internal/clients` | bounded in-memory per-client request/bandwidth ranking, persisted by the flush loop |
 | `internal/fleet` | neighbour-cache health probes (startup, then every 10 minutes) |
 | `internal/ui` | embedded dashboard (static files, vanilla JS, no external assets) |
 | `internal/systemd` | `LISTEN_FDS` socket-activation listener intake |
@@ -207,6 +208,7 @@ NEIGHBOUR_CACHES=http://goproxy1:9090,http://goproxy2:9090 ./goproxy
 <root>/download/<escaped module>/@v/<version>.sum    signed checksum record
 <root>/sumdb/                                        verification state + tiles
 /var/lib/goproxy/stats.db                            long-term stats (SQLite, WAL)
+/var/lib/goproxy/stats.db.backup.daily/              nightly compressed archives
 <root>/stats.db                                      (only when the state dir does not
                                                      exist, e.g. unprivileged local runs)
 ```
@@ -267,12 +269,63 @@ WAL journaling), so the single binary stays cgo-free. It holds:
 - **per-module access counters**: requests, bytes served and last use,
   restored at startup so the cache table and the top-modules bandwidth
   chart keep their ranking across restarts and deployments
+- **per-client counters**: requests, downstream bytes and last
+  seen, keyed by address (the `X-Forwarded-For` peer behind the reverse
+  proxy, otherwise the socket address). The dashboard ranks the top 10 by
+  requests and by bandwidth from the in-memory table; the database is only
+  touched by the 30-second flush
 - **one bucket per minute** of requests, hits, misses, bytes up/down/saved,
   verifications and cache-store size snapshots; kept forever (~half a
   million rows per year), aggregated into the 24h/7d/30d/1y and all-time
   dashboard series
 - **the event log**: recent events for the dashboard feed, pruned after
   90 days (buckets and totals are kept forever)
+
+The dashboard also shows the process memory picture: resident set, Go heap,
+goroutines and the cgroup limit systemd's hardening installed, so the 512M
+`MemoryMax` ceiling is visible instead of guessed.
+
+### Nightly maintenance window
+
+Every night at **23:00 local time** the proxy runs a maintenance window
+without restarting or pausing serving:
+
+1. **Semantic check** of the database: `PRAGMA quick_check`, a present
+   lifetime row, non-negative counters in every table, no future-dated
+   events or clients, and the lifetime request total never behind the
+   bucket history. Findings are logged and pushed to the event feed; the
+   window continues and the archive's own `quick_check` still gates the
+   backup.
+2. **WAL checkpoint (TRUNCATE)**, so the live file rests complete with an
+   empty WAL.
+3. **Reorganize**: `VACUUM` rewrites the file without free pages and
+   rebuilds every index, then `ANALYZE` and `PRAGMA optimize` refresh the
+   planner statistics.
+4. **Client retention**: rows not seen for 90 days are deleted.
+5. **Backup**: `VACUUM INTO` a consistent snapshot under a temporary
+   name, verified read-only and immutable with `quick_check`, renamed into
+   place, then compressed with gzip (0600). The uncompressed file is
+   removed only after the archive is complete; a failed compression leaves
+   the larger snapshot in place, and a crash mid-copy can never leave a
+   truncated file that looks like a rollback target.
+6. **Eight-generation cycle**: the newest eight archives are kept (the two
+   most recent always, regardless of age).
+7. **Final WAL checkpoint**, so the maintenance writes are in the main file
+   and the WAL is empty when the window closes.
+
+A start after a missed 23:00 window (host down, restart) catches up once,
+five minutes after startup. The window runs on the single SQLite
+connection, serialized with the recorder, so no write is lost and the
+request hot path stays on atomics.
+
+### In-memory caches
+
+Rows the dashboard reads constantly are held in memory rather than queried
+per push: the module index with its access counters, the client ranking,
+the lifetime totals and the process memory sample (refreshed at most once
+per second). Aggregated history series are shared for 20 seconds, so
+several open dashboards do not run the same SQL aggregation on every push.
+Only the 30-second flush loop and the nightly window touch the database.
 
 The request hot path never touches the database: counters are atomics,
 events flow through a buffered channel, and a collector goroutine flushes

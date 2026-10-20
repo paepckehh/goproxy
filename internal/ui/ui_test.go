@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"paepcke.de/goproxy/internal/clients"
 	"paepcke.de/goproxy/internal/fleet"
 	"paepcke.de/goproxy/internal/history"
 	"paepcke.de/goproxy/internal/stats"
@@ -36,7 +37,7 @@ func newTestUIWithPeers(t *testing.T, peers PeerSource) *Handler {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { hist.Close() })
-	return New(stats.New(nil), st, hist, "v0.0.0-test", peers, nil)
+	return New(stats.New(nil), st, hist, clients.New(), "v0.0.0-test", peers, nil)
 }
 
 type fakePeers []fleet.Status
@@ -63,6 +64,12 @@ func TestUI_IndexServesDashboard(t *testing.T) {
 	}
 	if !strings.Contains(body, "chart-history") {
 		t.Error("dashboard html missing the long-term history section")
+	}
+	if !strings.Contains(body, "Top clients by requests") || !strings.Contains(body, "Top clients by bandwidth") {
+		t.Error("dashboard html missing the top-clients sections")
+	}
+	if !strings.Contains(body, "kpi-mem") {
+		t.Error("dashboard html missing the process memory card")
 	}
 	if !strings.Contains(body, "Long-term archive") {
 		t.Error("dashboard html missing the long-term archive positioning")
@@ -327,7 +334,7 @@ func TestUI_EventsSSEStreamsNewEvents(t *testing.T) {
 		<-runDone
 	}()
 
-	reader := openSSE(t, New(m, st, hist, "v0.0.0-test", nil, nil), "")
+	reader := openSSE(t, New(m, st, hist, clients.New(), "v0.0.0-test", nil, nil), "")
 
 	// A fresh stream seeds the whole dashboard before live traffic.
 	for _, want := range []string{"events", "store", "prewarm", "stats", "history"} {
@@ -540,7 +547,7 @@ func TestUI_ReportsPopularModulesAndPrewarm(t *testing.T) {
 		Modules: 2, Fetched: 1, Bytes: 4096,
 		Items: []fleet.WarmItem{{Module: "example.com/hot", Version: "v1.0.0", Bytes: 4096}},
 	}
-	h := New(stats.New(nil), st, hist, "v-test", nil, fakePrewarm(report))
+	h := New(stats.New(nil), st, hist, clients.New(), "v-test", nil, fakePrewarm(report))
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dashboard", nil))
@@ -588,5 +595,56 @@ func TestUI_ReportsPopularModulesAndPrewarm(t *testing.T) {
 	}
 	if len(pushedReport.Items) != 1 {
 		t.Errorf("pushed prewarm = %+v, want the last sync details", pushedReport)
+	}
+}
+
+func TestUI_ReportsTopClientsAndMemory(t *testing.T) {
+	t.Parallel()
+	h := newTestUI(t)
+	h.clients.Record("10.0.0.1", 1000)
+	h.clients.Record("10.0.0.2", 5000)
+	h.clients.Record("10.0.0.2", 5000)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dashboard", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var payload struct {
+		Clients struct {
+			Tracked    int `json:"tracked"`
+			ByRequests []struct {
+				ID        string `json:"id"`
+				Requests  int64  `json:"requests"`
+				BytesDown int64  `json:"bytesDown"`
+			} `json:"byRequests"`
+			ByBytes []struct {
+				ID        string `json:"id"`
+				BytesDown int64  `json:"bytesDown"`
+			} `json:"byBytes"`
+		} `json:"clients"`
+		Stats struct {
+			Memory struct {
+				RSSBytes   int64 `json:"rssBytes"`
+				Goroutines int   `json:"goroutines"`
+				LimitBytes int64 `json:"limitBytes"`
+			} `json:"memory"`
+		} `json:"stats"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Clients.Tracked != 2 {
+		t.Errorf("tracked = %d, want 2", payload.Clients.Tracked)
+	}
+	if len(payload.Clients.ByRequests) != 2 || payload.Clients.ByRequests[0].ID != "10.0.0.2" {
+		t.Errorf("by requests = %+v, want the busiest client first", payload.Clients.ByRequests)
+	}
+	if len(payload.Clients.ByBytes) != 2 || payload.Clients.ByBytes[0].ID != "10.0.0.2" ||
+		payload.Clients.ByBytes[0].BytesDown != 10000 {
+		t.Errorf("by bytes = %+v, want 10.0.0.2 with 10000 bytes", payload.Clients.ByBytes)
+	}
+	if payload.Stats.Memory.Goroutines == 0 {
+		t.Error("memory snapshot missing goroutine count")
 	}
 }

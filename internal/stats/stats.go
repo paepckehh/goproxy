@@ -103,6 +103,7 @@ type Snapshot struct {
 	Events        []Event   `json:"events"`
 	DroppedEvents int64     `json:"droppedEvents"`
 	PersistErrors int64     `json:"persistErrors"`
+	Memory        Memory    `json:"memory"`
 	Started       bool      `json:"started"`
 }
 
@@ -141,6 +142,11 @@ type Stats struct {
 
 	loaded       Totals // totals restored from the recorder at startup
 	storeSampler func() StoreStat
+
+	memMu    sync.Mutex
+	mem      Memory
+	memAt    time.Time
+	memLimit int64
 
 	tickInterval  time.Duration
 	flushInterval time.Duration
@@ -184,6 +190,7 @@ func New(rec Recorder, opts ...Option) *Stats {
 		evCh:          make(chan Event, eventChanSize),
 		tickInterval:  defaultTick,
 		flushInterval: defaultFlush,
+		memLimit:      readMemoryLimit(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -487,6 +494,11 @@ func (s *Stats) Prewarm(modules, fetched, failed int, bytes int64) {
 	s.send(Event{Time: time.Now().UTC(), Result: "prewarm", Detail: detail})
 }
 
+// Maintenance publishes the result of a nightly stats-database window.
+func (s *Stats) Maintenance(detail string) {
+	s.send(Event{Time: time.Now().UTC(), Result: "maintenance", Detail: detail})
+}
+
 func verifiedText(v bool) string {
 	if v {
 		return "verified against checksum db"
@@ -523,21 +535,37 @@ func (s *Stats) send(ev Event) {
 
 // Snapshot returns the current state for the dashboard.
 func (s *Stats) Snapshot() Snapshot {
+	return s.snapshot(true)
+}
+
+// Counters is Snapshot without the event ring: the live push sends events
+// individually on the same stream, so copying 512 rows every tick would be
+// wasted work.
+func (s *Stats) Counters() Snapshot {
+	return s.snapshot(false)
+}
+
+func (s *Stats) snapshot(withEvents bool) Snapshot {
 	t := s.totals()
-	s.evMu.Lock()
-	events := make([]Event, len(s.events))
-	copy(events, s.events)
-	s.evMu.Unlock()
+	var events []Event
+	if withEvents {
+		s.evMu.Lock()
+		events = make([]Event, len(s.events))
+		copy(events, s.events)
+		s.evMu.Unlock()
+	}
 	s.tMu.Lock()
 	traffic := make([]Traffic, len(s.traffic))
 	copy(traffic, s.traffic)
 	s.tMu.Unlock()
-	// Newest first for the feed.
-	for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
-		events[i], events[j] = events[j], events[i]
-	}
-	if len(events) > 128 {
-		events = events[:128]
+	if withEvents {
+		// Newest first for the feed.
+		for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
+			events[i], events[j] = events[j], events[i]
+		}
+		if len(events) > 128 {
+			events = events[:128]
+		}
 	}
 	return Snapshot{
 		StartedAt:     s.started,
@@ -548,6 +576,7 @@ func (s *Stats) Snapshot() Snapshot {
 		Events:        events,
 		DroppedEvents: s.dropped.Load(),
 		PersistErrors: s.dbErrs.Load(),
+		Memory:        s.memory(),
 		Started:       true,
 	}
 }

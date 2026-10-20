@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"paepcke.de/goproxy/internal/clients"
 	"paepcke.de/goproxy/internal/fleet"
 	"paepcke.de/goproxy/internal/history"
 	"paepcke.de/goproxy/internal/proxy"
@@ -84,6 +85,12 @@ func main() {
 		os.Exit(1)
 	}
 	st.RestoreUsage(usage)
+	clientUsage, err := hist.LoadClients(clientLoadLimit)
+	if err != nil {
+		log.Warn("loading client usage", "err", err)
+	}
+	tracker := clients.New()
+	tracker.Restore(clientUsage)
 	m := stats.New(hist, stats.WithStoreSampler(func() stats.StoreStat {
 		su := st.Summary()
 		return stats.StoreStat{
@@ -106,7 +113,7 @@ func main() {
 	// The warmer pre-caches the hottest modules; the dashboard shows the
 	// details of the most recent pass.
 	warmer := proxy.NewWarmer(p, st.Popular, log)
-	uiH := ui.New(m, st, hist, ver, peers, warmer)
+	uiH := ui.New(m, st, hist, tracker, ver, peers, warmer)
 
 	// Socket activation: serve on the sockets systemd passed (LISTEN_FDS)
 	// when present; otherwise bind the resolved address. EXIT_ON_IDLE is
@@ -139,7 +146,7 @@ func main() {
 	// and the hourly fleet cache sync. All of it stops with ctx.
 	indexed := make(chan struct{})
 	var jobs sync.WaitGroup
-	jobs.Add(3)
+	jobs.Add(4)
 	go func() {
 		defer jobs.Done()
 		peers.Run(ctx)
@@ -147,6 +154,10 @@ func main() {
 	go func() {
 		defer jobs.Done()
 		db.RefreshLoop(ctx, sumdbRefreshInterval)
+	}()
+	go func() {
+		defer jobs.Done()
+		runMaintenance(ctx, hist, m, log, ver)
 	}()
 	go func() {
 		defer jobs.Done()
@@ -191,12 +202,13 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				persistModuleUsage(hist, st, log)
+				persistUsage(hist, st, tracker, log)
 			}
 		}
 	}()
 
 	handler := dispatch(p, uiH, ver)
+	handler = withClientStats(handler, tracker)
 	if debug {
 		handler = withAccessLog(handler, log)
 	}
@@ -263,9 +275,9 @@ func main() {
 	<-statsDone
 	<-histDone
 	<-usageDone
-	// Final module usage snapshot before the database closes, so a restart
-	// resumes the served-bandwidth totals where they left off.
-	persistModuleUsage(hist, st, log)
+	// Final module and client usage snapshot before the database closes, so
+	// a restart resumes the served-bandwidth totals where they left off.
+	persistUsage(hist, st, tracker, log)
 	if err := hist.Close(); err != nil {
 		log.Error("closing stats database", "err", err)
 		exitCode = 1
@@ -278,19 +290,27 @@ func main() {
 	}
 }
 
-// moduleFlushInterval bounds how much per-module access accounting a crash
-// can lose; the counters are always written once more on shutdown.
+// moduleFlushInterval bounds how much per-module and per-client access
+// accounting a crash can lose; both are always written once more on
+// shutdown.
 const moduleFlushInterval = 30 * time.Second
+
+// clientLoadLimit bounds how many persisted clients are restored into the
+// in-memory ranking at startup.
+const clientLoadLimit = clients.MaxTracked
 
 // sumdbRefreshInterval keeps the signed checksum-database tree head fresh,
 // so verification never starts from a stale transparency-log view.
 const sumdbRefreshInterval = 15 * time.Minute
 
-// persistModuleUsage writes the modules that saw traffic since the last
-// flush, so the dashboard's served-bandwidth ranking survives restarts.
-func persistModuleUsage(hist *history.DB, st *store.Store, log *slog.Logger) {
+// persistUsage writes the modules and clients that saw traffic since the
+// last flush, so the dashboard rankings survive restarts.
+func persistUsage(hist *history.DB, st *store.Store, tracker *clients.Tracker, log *slog.Logger) {
 	if err := hist.SaveModuleUsage(st.TakeUsage()); err != nil {
 		log.Warn("persisting module usage", "err", err)
+	}
+	if err := hist.SaveClients(tracker.TakeDirty()); err != nil {
+		log.Warn("persisting client usage", "err", err)
 	}
 }
 
