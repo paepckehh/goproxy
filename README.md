@@ -31,7 +31,7 @@ Everything a fleet of build machines needs, in one dependency-free binary.
 | --- | --- |
 | **Fast** | In-memory index over a standard `download/` layout, singleflight download dedup, atomic cache commits, `sendfile`-backed serving, negative caching of upstream 404s |
 | **Secure** | Every `.zip` and `.mod` is hash-verified against the signed sum.golang.org checksum database: Ed25519 note signature, transparency-log tree consistency, and tile inclusion proofs. Tampered content is refused, never cached |
-| **Observable** | Embedded dashboard with zero external assets: hit ratio, bandwidth saved, traffic, store usage, top modules, live event feed, and 24h to all-time history charts |
+| **Observable** | Embedded dashboard with zero external assets, pushed live over one SSE stream (counters, cache table, events, history): hit ratio, bandwidth saved, traffic, store usage, a 3D top-modules chart with a fixed (non-rotating) name agenda, live event feed, and 24h to all-time history charts |
 | **Persistent** | Lifetime counters, minute-resolution buckets and the event log survive reboots in SQLite (pure-Go driver, WAL journaling) |
 | **Deployable** | Socket activation with idle exit, hardened systemd units, NixOS modules, static cgo-free binary |
 | **Honest failure** | Checksum-database outages fail closed (a missing tile is an outage, not an unknown module); recorder errors surface as warning pills on the dashboard (`persistErrors`, dropped events) and never degrade proxying |
@@ -91,6 +91,7 @@ Flags (environment variables are used by the systemd units; flags win over env):
 | `CACHE_ROOT` | module cache directory, e.g. a dedicated disk (`-root` flag wins, then this, then `cache`) |
 | `SOCKET_ACTIVATION=1` | serve on the sockets systemd passed via the `LISTEN_FDS` protocol; if none were passed, log a warning and fall back to `BIND_ADDR` |
 | `EXIT_ON_IDLE=1` | exit cleanly once no request has been in flight for 30s; only honored in socket-activated mode, where systemd re-arms the socket and restarts the proxy on the next connection |
+| `DEBUG=1` | enable verbose per-request logging: one access line per request plus routine failure detail (upstream 404s, checksum-db probes, unverified private modules). Without it the journal only carries startup state, warnings and security refusals |
 
 ## API reference
 
@@ -104,9 +105,9 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 | `GET /<module>/@v/<v>.mod` | cached, hash-verified against the checksum database |
 | `GET /<module>/@v/<v>.zip` | cached, hash-verified against the checksum database |
 | `GET /sumdb/<db>/...` | forwarded verbatim to the configured database only (404 otherwise), with the `/supported` probe answered locally, so go clients run their full verification through the proxy |
-| `GET /` | operations dashboard (live: 2s KPI poll, events pushed over SSE) |
-| `GET /api/dashboard` | JSON: stats, store, modules, events |
-| `GET /api/events` | Server-Sent Events stream: one `event` message per new proxy event |
+| `GET /` | operations dashboard (all updates pushed over SSE; polling only as a no-EventSource fallback) |
+| `GET /api/dashboard` | JSON snapshot: stats, store, modules, events |
+| `GET /api/events?range=24h` | Server-Sent Events stream: `events` seed, `store` cache table (only when changed), `stats` counters every 2s, `history` for the selected range every 30s, and one `event` message per new proxy event |
 | `GET /api/history?range=24h` | long-term stats series (`24h`, `7d`, `30d`, `1y`, `all`) |
 | `GET /healthz` | liveness plus version |
 

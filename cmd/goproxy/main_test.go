@@ -1,8 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -52,4 +58,56 @@ func TestResolveStatsDB(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLogLevel(t *testing.T) {
+	if got := logLevel(false); got != slog.LevelInfo {
+		t.Errorf("logLevel(false) = %v, want Info", got)
+	}
+	if got := logLevel(true); got != slog.LevelDebug {
+		t.Errorf("logLevel(true) = %v, want Debug", got)
+	}
+}
+
+func TestAccessLogHonorsLevel(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		level slog.Level
+		want  string
+	}{
+		{name: "default hides access lines", level: slog.LevelInfo, want: ""},
+		{name: "DEBUG shows access lines", level: slog.LevelDebug, want: "access"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: tc.level}))
+			h := withAccessLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusTeapot)
+			}), log)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/example.com/m/@v/list", nil))
+			got := buf.String()
+			if tc.want == "" {
+				if got != "" {
+					t.Fatalf("logs = %q, want no access line", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) || !strings.Contains(got, "418") {
+				t.Fatalf("logs = %q, want the access line with status", got)
+			}
+		})
+	}
+}
+
+// The SSE dashboard streams through the access-log wrapper; it must still
+// expose http.Flusher.
+func TestAccessLogKeepsFlusher(t *testing.T) {
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	h := withAccessLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := w.(http.Flusher); !ok {
+			t.Error("wrapped writer lost http.Flusher")
+		}
+	}), log)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/events", nil))
 }

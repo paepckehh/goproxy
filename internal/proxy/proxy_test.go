@@ -740,7 +740,7 @@ func TestProxy_UpstreamUnreachableFailsClosed(t *testing.T) {
 	dead.Close()
 
 	var logs bytes.Buffer
-	p, err := New(env.store, env.sumdbDB, env.stats, url, true, &http.Client{Timeout: 2 * time.Second}, slog.New(slog.NewJSONHandler(&logs, nil)))
+	p, err := New(env.store, env.sumdbDB, env.stats, url, true, &http.Client{Timeout: 2 * time.Second}, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -767,7 +767,7 @@ func TestProxy_UpstreamUnreachablePassthroughLogged(t *testing.T) {
 	dead.Close()
 
 	var logs bytes.Buffer
-	p, err := New(env.store, env.sumdbDB, env.stats, url, true, &http.Client{Timeout: 2 * time.Second}, slog.New(slog.NewJSONHandler(&logs, nil)))
+	p, err := New(env.store, env.sumdbDB, env.stats, url, true, &http.Client{Timeout: 2 * time.Second}, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -794,7 +794,7 @@ func TestProxy_UpstreamErrorStatusLogged(t *testing.T) {
 	t.Cleanup(broken.Close)
 
 	var logs bytes.Buffer
-	p, err := New(env.store, env.sumdbDB, env.stats, broken.URL, true, broken.Client(), slog.New(slog.NewJSONHandler(&logs, nil)))
+	p, err := New(env.store, env.sumdbDB, env.stats, broken.URL, true, broken.Client(), slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -810,5 +810,32 @@ func TestProxy_UpstreamErrorStatusLogged(t *testing.T) {
 	got := logs.String()
 	if !strings.Contains(got, "upstream refused request") || !strings.Contains(got, "upstream exploded") {
 		t.Errorf("logs = %q, want the upstream status and body logged", got)
+	}
+}
+
+// Routine per-request failures must stay out of the journal at the default
+// level; DEBUG=1 (LevelDebug) is what surfaces them.
+func TestProxy_RoutineFailuresSilentAtDefaultLevel(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t, nil)
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "upstream exploded", http.StatusInternalServerError)
+	}))
+	t.Cleanup(broken.Close)
+
+	var logs bytes.Buffer
+	p, err := New(env.store, env.sumdbDB, env.stats, broken.URL, true, broken.Client(),
+		slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/"+testMod+"/@v/list", nil)
+	rec := httptest.NewRecorder()
+	p.ServeModule(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rec.Code)
+	}
+	if got := logs.String(); got != "" {
+		t.Errorf("logs = %q, want no per-request noise without DEBUG=1", got)
 	}
 }

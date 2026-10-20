@@ -241,12 +241,40 @@ func TestUI_EventsSSEStreamsNewEvents(t *testing.T) {
 		<-runDone
 	}()
 
-	srv := httptest.NewServer(New(m, st, hist, "v0.0.0-test"))
-	defer srv.Close()
+	reader := openSSE(t, New(m, st, hist, "v0.0.0-test"), "")
 
-	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, srv.URL+"/api/events", nil)
+	// A fresh stream seeds the whole dashboard before live traffic.
+	for _, want := range []string{"events", "store", "stats", "history"} {
+		if name, _ := readSSE(t, reader); name != want {
+			t.Fatalf("seed message = %q, want %q", name, want)
+		}
+	}
+
+	m.Hit("example.com/m", "v1.0.0", "zip", 42, time.Millisecond)
+
+	name, payload := readSSE(t, reader)
+	if name != "event" {
+		t.Fatalf("message = %q, want event", name)
+	}
+	var ev stats.Event
+	if err := json.Unmarshal(payload, &ev); err != nil {
+		t.Fatalf("event payload %q: %v", payload, err)
+	}
+	if ev.Result != "hit" || ev.Module != "example.com/m" || ev.Bytes != 42 {
+		t.Errorf("event = %+v", ev)
+	}
+}
+
+// openSSE connects to /api/events and consumes the "connected" comment,
+// leaving the reader at the first seeded event.
+func openSSE(t *testing.T, h *Handler, query string) *bufio.Reader {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	reqCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, srv.URL+"/api/events"+query, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,14 +282,12 @@ func TestUI_EventsSSEStreamsNewEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	t.Cleanup(func() { resp.Body.Close() })
 	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
 		t.Fatalf("content type = %q", ct)
 	}
 
 	reader := bufio.NewReader(resp.Body)
-	// The handler subscribes before sending this comment, so once it is
-	// read the stream is guaranteed to observe following events.
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		t.Fatal(err)
@@ -269,25 +295,87 @@ func TestUI_EventsSSEStreamsNewEvents(t *testing.T) {
 	if !strings.HasPrefix(line, ": connected") {
 		t.Fatalf("first line = %q", line)
 	}
+	return reader
+}
 
-	m.Hit("example.com/m", "v1.0.0", "zip", 42, time.Millisecond)
-
-	var payload string
+// readSSE returns the next named message (comments and keepalives are
+// skipped) and its JSON payload.
+func readSSE(t *testing.T, r *bufio.Reader) (string, []byte) {
+	t.Helper()
+	var event string
+	var data []byte
 	for {
-		line, err = reader.ReadString('\n')
+		line, err := r.ReadString('\n')
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("read SSE: %v", err)
 		}
-		if data, ok := strings.CutPrefix(line, "data: "); ok {
-			payload = strings.TrimSuffix(data, "\n")
-			break
+		line = strings.TrimRight(line, "\r\n")
+		switch {
+		case line == "":
+			if event != "" {
+				return event, data
+			}
+		case strings.HasPrefix(line, ":"):
+			// comment or keepalive
+		case strings.HasPrefix(line, "event: "):
+			event = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			data = []byte(strings.TrimPrefix(line, "data: "))
 		}
 	}
-	var ev stats.Event
-	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
-		t.Fatalf("event payload %q: %v", payload, err)
+}
+
+// The seed carries the cache table, and cache changes are pushed without
+// any polling.
+func TestUI_EventsSSEPushesCacheUpdates(t *testing.T) {
+	t.Parallel()
+	h := newTestUI(t)
+	reader := openSSE(t, h, "?range=24h")
+
+	seeded := map[string]bool{}
+	for len(seeded) < 4 {
+		name, payload := readSSE(t, reader)
+		seeded[name] = true
+		if name != "store" {
+			continue
+		}
+		var state struct {
+			Version string          `json:"version"`
+			Modules []store.ModStat `json:"modules"`
+		}
+		if err := json.Unmarshal(payload, &state); err != nil {
+			t.Fatalf("store payload %q: %v", payload, err)
+		}
+		if state.Version != "v0.0.0-test" {
+			t.Errorf("version = %q", state.Version)
+		}
+		if len(state.Modules) != 1 || state.Modules[0].Path != "example.com/m" {
+			t.Errorf("seed modules = %+v", state.Modules)
+		}
 	}
-	if ev.Result != "hit" || ev.Module != "example.com/m" || ev.Bytes != 42 {
-		t.Errorf("event = %+v", ev)
+
+	if _, err := h.store.PutBytes("example.com/new", "v1.0.0", store.KindMod,
+		[]byte("module example.com/new\n"), "h1:y=", true); err != nil {
+		t.Fatal(err)
 	}
+
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		name, payload := readSSE(t, reader)
+		if name != "store" {
+			continue
+		}
+		var state struct {
+			Modules []store.ModStat `json:"modules"`
+		}
+		if err := json.Unmarshal(payload, &state); err != nil {
+			t.Fatalf("store payload %q: %v", payload, err)
+		}
+		for _, m := range state.Modules {
+			if m.Path == "example.com/new" {
+				return
+			}
+		}
+	}
+	t.Fatal("no pushed cache update carrying the new module")
 }

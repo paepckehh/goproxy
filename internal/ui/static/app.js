@@ -73,6 +73,7 @@ function renderWarn(id, n, label) {
 }
 
 function renderKPIs(s, store) {
+  if (!s || !store) return;
   const L = s.lifetime;
   countUp("kpi-requests", L.requests, fmtNum);
   $("kpi-requests-sub").textContent =
@@ -107,6 +108,8 @@ function shortMod(path) {
   return parts.length > 2 ? parts.slice(-2).join("/") : path;
 }
 
+// The module table is rebuilt only when the pushed cache state changed,
+// so an idle dashboard never reloads rows under the cursor.
 function renderModules(mods) {
   const body = $("modules-body");
   $("modules-empty").style.display = mods.length ? "none" : "block";
@@ -141,6 +144,12 @@ function eventChip(result) {
   }
 }
 
+function eventKey(ev) {
+  return [ev.time, ev.module, ev.version, ev.kind, ev.result].join("|");
+}
+
+const eventKeys = new Set();
+
 function eventItem(ev) {
   const target = ev.module
     ? escapeHTML(ev.module) + (ev.version ? " " + escapeHTML(ev.version) : "")
@@ -148,7 +157,7 @@ function eventItem(ev) {
   const detail = ev.detail
     ? escapeHTML(ev.detail)
     : (ev.kind || "") + (ev.bytes ? " · " + fmtBytes(ev.bytes) : "");
-  return `<li>
+  return `<li data-key="${escapeHTML(eventKey(ev))}">
       ${eventChip(ev.result)}
       <div class="ev-main">
         <div class="ev-mod">${target}</div>
@@ -162,22 +171,33 @@ const MAX_EVENTS = 24;
 
 function updateEventsMeta(count) {
   $("events-empty").style.display = count ? "none" : "block";
-  $("events-hint").textContent = count ? "newest first · live · " + count : "";
+  $("events-hint").textContent = count ? "newest first · pushed live · " + count : "";
 }
 
-// Full render, used for the first paint and after an SSE reconnect.
+// Full render, used for the initial seed and after an SSE reconnect.
 function renderEvents(events) {
   const ul = $("events");
-  ul.innerHTML = events.slice(0, MAX_EVENTS).map(eventItem).join("");
+  const shown = events.slice(0, MAX_EVENTS);
+  eventKeys.clear();
+  shown.forEach((ev) => eventKeys.add(eventKey(ev)));
+  ul.innerHTML = shown.map(eventItem).join("");
   updateEventsMeta(ul.children.length);
 }
 
 // Live append: one new node at the top, existing nodes stay untouched so
-// the feed never reloads or loses hover/focus while nothing changes.
+// the feed never reloads or loses hover/focus while nothing changes. The
+// seed and the first pushed events can overlap, hence the key check.
 function appendEvent(ev) {
+  const key = eventKey(ev);
+  if (eventKeys.has(key)) return;
   const ul = $("events");
   ul.insertAdjacentHTML("afterbegin", eventItem(ev));
-  while (ul.children.length > MAX_EVENTS) ul.removeChild(ul.lastElementChild);
+  eventKeys.add(key);
+  while (ul.children.length > MAX_EVENTS) {
+    const last = ul.lastElementChild;
+    eventKeys.delete(last.dataset.key);
+    ul.removeChild(last);
+  }
   updateEventsMeta(ul.children.length);
 }
 
@@ -186,11 +206,27 @@ function escapeHTML(s) {
 }
 
 // ---- 3D rotating bar chart: top modules by served bandwidth ----
+const AGENDA_MAX = 8;
+
+// Color by rank, not by rotation depth, so the fixed agenda always
+// matches the bars.
+function barColor(i, n) {
+  const t = n <= 1 ? 0.5 : i / (n - 1);
+  const hue = 250 + (190 - 250) * t;
+  return {
+    top: `hsl(${hue} 85% 62%)`,
+    front: `hsl(${hue} 70% 44% / 0.92)`,
+    side: `hsl(${hue} 65% 32% / 0.92)`,
+    swatch: `hsl(${hue} 85% 58%)`,
+  };
+}
+
 const chart3d = {
   canvas: null,
   ctx: null,
   rot: 0.6,
   data: [],
+  key: "",
   w: 0,
   h: 0,
 
@@ -218,10 +254,16 @@ const chart3d = {
   },
 
   setData(mods) {
-    this.data = mods.slice(0, 8).map((m) => ({
+    const data = mods.slice(0, AGENDA_MAX).map((m) => ({
       label: shortMod(m.path),
+      full: m.path,
       value: m.servedBytes,
     }));
+    const key = data.map((d) => d.full + ":" + d.value).join("|");
+    if (key === this.key) return;
+    this.key = key;
+    this.data = data;
+    renderAgenda(data);
   },
 
   project(x, y, z) {
@@ -266,17 +308,12 @@ const chart3d = {
     const bars = this.data.map((d, i) => {
       const height = 18 + (d.value / maxV) * maxH;
       const x = (i - (n - 1) / 2) * spacing;
-      return { ...d, x, height, depth: x * Math.sin(this.rot) };
+      return { ...d, i, x, height, depth: x * Math.sin(this.rot) };
     });
     bars.sort((a, b) => a.depth - b.depth);
 
-    const hue0 = 250, hue1 = 190;
-    bars.forEach((b, rank) => {
-      const t = n === 1 ? 0.5 : rank / (n - 1);
-      const hue = hue0 + (hue1 - hue0) * t;
-      const top = `hsl(${hue} 85% 62%)`;
-      const front = `hsl(${hue} 70% 44% / 0.92)`;
-      const side = `hsl(${hue} 65% 32% / 0.92)`;
+    bars.forEach((b) => {
+      const { top, front, side } = barColor(b.i, n);
 
       const c = [
         this.project(b.x - bw / 2, 0, -bw / 2), this.project(b.x + bw / 2, 0, -bw / 2),
@@ -304,23 +341,31 @@ const chart3d = {
       ctx.lineTo(c[6].x, c[6].y); ctx.lineTo(c[7].x, c[7].y);
       ctx.closePath(); ctx.fill();
 
-      // Value above the bar.
+      // Rank and value above the bar; the name lives in the fixed agenda.
       const labelY = this.project(b.x, b.height + 16, 0);
       ctx.fillStyle = "#e6ecf7";
       ctx.font = "600 11px ui-monospace, monospace";
       ctx.textAlign = "center";
-      ctx.fillText(fmtBytes(b.value), labelY.x, labelY.y);
-
-      // Module name on the floor.
-      const name = this.project(b.x, 0, 0);
-      ctx.fillStyle = "#8291ad";
-      ctx.font = "10.5px ui-monospace, monospace";
-      let text = b.label;
-      while (text.length > 14 && ctx.measureText(text).width > spacing + 26) text = text.slice(1);
-      ctx.fillText(text.length < b.label.length ? "…" + text : text, name.x, name.y + 16);
+      ctx.fillText((b.i + 1) + " · " + fmtBytes(b.value), labelY.x, labelY.y);
     });
   },
 };
+
+// Non-rotating agenda: module names stay readable while the 3D scene
+// turns. The rank and swatch match the bar index.
+function renderAgenda(data) {
+  const ul = $("chart3d-agenda");
+  if (!ul) return;
+  ul.innerHTML = data.map((d, i) => {
+    const color = barColor(i, data.length);
+    return `<li>
+      <span class="ag-swatch" style="background:${color.swatch};color:${color.swatch}"></span>
+      <span class="ag-rank">${i + 1}</span>
+      <span class="ag-name" title="${escapeHTML(d.full)}">${escapeHTML(d.label)}</span>
+      <span class="ag-val">${fmtBytes(d.value)}</span>
+    </li>`;
+  }).join("");
+}
 
 // ---- Traffic area chart: hits/misses stacked, bytes as a line ----
 function drawTraffic(traffic) {
@@ -510,8 +555,9 @@ function renderHistorySummary(s) {
   $("history-summary").innerHTML = chips.join("");
 }
 
-// historySeq guards against stale responses: the 60s poll and range-click
-// fetches can resolve out of order, and only the newest request may render.
+// historySeq guards against stale responses: the fallback fetch and
+// range-click fetches can resolve out of order, and only the newest
+// request may render.
 let historySeq = 0;
 
 async function fetchHistory() {
@@ -523,40 +569,45 @@ async function fetchHistory() {
     if (!resp.ok) throw new Error("status " + resp.status);
     const data = await resp.json();
     if (seq !== historySeq) return; // superseded by a newer request
-    drawHistory(data);
-    renderHistorySummary(data.summary || {});
+    applyHistory(data);
   } catch (err) {
-    // keep the last rendered chart; the next poll retries
+    // keep the last rendered chart; the next push or poll retries
   }
 }
 
-// Dashboard polls can overlap on a slow backend; only the newest response
-// may render, otherwise counters would jump backwards.
-let pollSeq = 0;
+function applyStats(s) {
+  if (!s) return;
+  state.stats = s;
+  if (Array.isArray(s.events)) renderEvents(s.events);
+  renderHeader(s);
+  if (state.store) renderKPIs(s, state.store);
+  drawTraffic(s.traffic);
+}
 
-async function poll() {
-  const seq = ++pollSeq;
-  try {
-    const resp = await fetch("/api/dashboard", { cache: "no-store" });
-    if (!resp.ok) throw new Error("status " + resp.status);
-    const data = await resp.json();
-    if (seq !== pollSeq) return; // superseded by a newer poll
-    state.version = data.version;
-    state.stats = data.stats;
-    state.store = data.store;
-    state.modules = data.modules || [];
-    renderHeader(data.stats);
-    renderKPIs(data.stats, data.store);
-    renderModules(state.modules);
-    // With a live SSE stream the event list owns itself; polling only
-    // seeds it and keeps it correct when the stream is unavailable.
-    if (!sseLive) renderEvents(data.stats.events || []);
-    chart3d.setData(state.modules);
-    drawTraffic(data.stats.traffic);
-    setConn(true);
-  } catch (err) {
-    if (seq === pollSeq) setConn(false);
+function applyStore(payload) {
+  if (!payload) return;
+  if (payload.version) state.version = payload.version;
+  if (payload.store) state.store = payload.store;
+  if (Array.isArray(payload.modules)) {
+    state.modules = payload.modules;
+    renderModules(payload.modules);
+    chart3d.setData(payload.modules);
   }
+  if (state.stats) renderKPIs(state.stats, state.store);
+}
+
+function applyHistory(data) {
+  if (!data) return;
+  drawHistory(data);
+  renderHistorySummary(data.summary || {});
+}
+
+// Fallback path for browsers without EventSource support.
+function applyDashboard(data) {
+  if (!data) return;
+  if (data.version) state.version = data.version;
+  applyStore(data);
+  applyStats(data.stats);
 }
 
 function setConn(ok) {
@@ -571,48 +622,83 @@ function setConn(ok) {
   }
 }
 
-chart3d.init();
-
-// ---- Live event feed: server push over SSE ----
+// ---- Live dashboard: one SSE stream carries every update ----
 let sseLive = false;
-let sseOpened = false;
+let sse = null;
+let pollTimer = null;
 
-async function resyncEvents() {
+async function poll() {
   try {
     const resp = await fetch("/api/dashboard", { cache: "no-store" });
-    if (!resp.ok) return;
-    const data = await resp.json();
-    renderEvents((data.stats && data.stats.events) || []);
+    if (!resp.ok) throw new Error("status " + resp.status);
+    applyDashboard(await resp.json());
+    setConn(true);
   } catch (err) {
-    // The next reconnect or poll retries.
+    setConn(false);
   }
 }
 
+// Polling is only the fallback while no live stream is open.
+function startFallback() {
+  if (pollTimer) return;
+  poll();
+  pollTimer = setInterval(poll, 10000);
+}
+
+function stopFallback() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function parseSSE(msg) {
+  try {
+    return JSON.parse(msg.data);
+  } catch (err) {
+    return null;
+  }
+}
+
+// connectEvents opens the live stream for the current history range. The
+// server seeds events, cache state, counters and history, then pushes
+// every change; no dashboard data is polled while it is open.
 function connectEvents() {
-  if (!("EventSource" in window)) return; // polls keep the feed current
-  const sse = new EventSource("/api/events");
-  sse.addEventListener("event", (msg) => {
-    let ev;
-    try {
-      ev = JSON.parse(msg.data);
-    } catch (err) {
-      return;
-    }
+  if (!("EventSource" in window)) {
+    startFallback();
+    return;
+  }
+  if (sse) {
+    sse.close();
+    sse = null;
+  }
+  const source = new EventSource("/api/events?range=" + encodeURIComponent(state.historyRange));
+  sse = source;
+
+  source.addEventListener("events", (msg) => {
+    const events = parseSSE(msg);
+    if (Array.isArray(events)) renderEvents(events);
+  });
+  source.addEventListener("stats", (msg) => applyStats(parseSSE(msg)));
+  source.addEventListener("store", (msg) => applyStore(parseSSE(msg)));
+  source.addEventListener("history", (msg) => applyHistory(parseSSE(msg)));
+  source.addEventListener("event", (msg) => {
+    const ev = parseSSE(msg);
+    if (!ev) return;
     sseLive = true;
     appendEvent(ev);
     setConn(true);
   });
-  sse.onopen = () => {
+  source.onopen = () => {
     sseLive = true;
     setConn(true);
-    // Events emitted while the stream was down are not replayed.
-    if (sseOpened) resyncEvents();
-    sseOpened = true;
+    stopFallback();
   };
-  sse.onerror = () => {
+  source.onerror = () => {
     // EventSource reconnects on its own; polling takes over meanwhile.
     sseLive = false;
     setConn(false);
+    startFallback();
   };
 }
 
@@ -628,11 +714,16 @@ document.querySelectorAll("#ranges button").forEach((btn) => {
     document.querySelectorAll("#ranges button").forEach((b) => b.classList.remove("active"));
     btn.classList.add("active");
     state.historyRange = btn.dataset.range;
-    fetchHistory();
+    // A new stream carries the newly selected range; without SSE fall
+    // back to a direct fetch.
+    connectEvents();
+    if (!("EventSource" in window)) fetchHistory();
   });
 });
-poll();
+
+chart3d.init();
+// One immediate fetch paints the dashboard before the stream is open;
+// the stream then owns every update. fetchHistory is the no-SSE path.
 fetchHistory();
+if (!("EventSource" in window)) startFallback();
 connectEvents();
-setInterval(poll, 2000);
-setInterval(fetchHistory, 60000);

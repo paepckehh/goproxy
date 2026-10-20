@@ -37,7 +37,8 @@ func main() {
 	verify := flag.Bool("verify", true, "verify module hashes against the checksum database")
 	flag.Parse()
 
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	debug := envBool("DEBUG")
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel(debug)}))
 	ver := version.Get()
 	listenAddr := resolveAddr(*addr)
 
@@ -140,9 +141,13 @@ func main() {
 		close(statsDone)
 	}()
 
+	handler := dispatch(p, uiH, ver)
+	if debug {
+		handler = withAccessLog(handler, log)
+	}
 	srv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           dispatch(p, uiH, ver),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
@@ -250,6 +255,16 @@ func resolveStatsDB(root, stateDir string) string {
 		return filepath.Join(stateDir, "stats.db")
 	}
 	return filepath.Join(root, "stats.db")
+}
+
+// logLevel keeps per-request access and failure lines (Debug) out of the
+// journal unless DEBUG=1; startup state, warnings and security refusals
+// are always logged.
+func logLevel(debug bool) slog.Level {
+	if debug {
+		return slog.LevelDebug
+	}
+	return slog.LevelInfo
 }
 
 // envBool reports whether an environment variable holds a truthy value.

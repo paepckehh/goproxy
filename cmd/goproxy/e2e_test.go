@@ -137,18 +137,26 @@ func TestE2E_FullStackFetchesRealModule(t *testing.T) {
 		t.Errorf("go.mod not cached and verified: %+v", mod)
 	}
 
-	// The connected dashboard receives the miss as a pushed event.
+	// The connected dashboard receives the miss as a pushed event. The
+	// stream also seeds and periodically pushes state messages, so only
+	// "event" messages are decoded.
 	var event stats.Event
+	var kind string
 	for {
 		line, err := stream.ReadString('\n')
 		if err != nil {
 			t.Fatalf("waiting for the pushed event: %v", err)
 		}
-		payload, ok := strings.CutPrefix(line, "data: ")
-		if !ok {
+		line = strings.TrimSpace(line)
+		if name, ok := strings.CutPrefix(line, "event: "); ok {
+			kind = name
 			continue
 		}
-		if err := json.Unmarshal([]byte(strings.TrimSpace(payload)), &event); err != nil {
+		payload, ok := strings.CutPrefix(line, "data: ")
+		if !ok || kind != "event" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
 			t.Fatalf("event payload %q: %v", payload, err)
 		}
 		if event.Module == e2eModule {
