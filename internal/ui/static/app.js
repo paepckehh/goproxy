@@ -76,8 +76,9 @@ function renderKPIs(s, store) {
   if (!s || !store) return;
   const L = s.lifetime;
   countUp("kpi-requests", L.requests, fmtNum);
+  const neighbour = L.neighbourHits > 0 ? " · " + fmtNum(L.neighbourHits) + " neighbour" : "";
   $("kpi-requests-sub").textContent =
-    fmtNum(L.hits) + " hits · " + fmtNum(L.misses) + " misses · " + fmtNum(L.passes) + " passes";
+    fmtNum(L.hits) + " hits · " + fmtNum(L.misses) + " misses · " + fmtNum(L.passes) + " passes" + neighbour;
 
   const denom = L.hits + L.misses;
   const ratio = denom > 0 ? L.hits / denom : 0;
@@ -101,6 +102,20 @@ function renderKPIs(s, store) {
   countUp("kpi-store", store.sizeBytes, fmtBytes);
   $("kpi-store-sub").textContent =
     fmtNum(store.modules) + " modules · " + fmtNum(store.versions) + " versions · " + fmtNum(store.files) + " files";
+
+  countUp("kpi-neighbour", L.neighbourHits, fmtNum);
+  $("kpi-neighbour-sub").textContent = neighbourSub(L);
+}
+
+// Neighbour caches: how often a peer had the artifact and how much
+// bandwidth that saved us from pulling from the upstream proxy.
+function neighbourSub(L) {
+  const hits = L.neighbourHits || 0;
+  const misses = L.neighbourMisses || 0;
+  if (hits === 0 && misses === 0) return "no neighbour lookups yet";
+  const fetched = fmtBytes(L.bytesNeighbour || 0) + " from neighbours";
+  if (misses === 0) return fetched;
+  return fetched + " · " + fmtNum(misses) + " fell back upstream";
 }
 
 function shortMod(path) {
@@ -137,6 +152,7 @@ function eventChip(result) {
     case "hit": return '<span class="chip ok">hit</span>';
     case "miss": return '<span class="chip warn">miss</span>';
     case "pass": return '<span class="chip ok">pass</span>';
+    case "neighbour": return '<span class="chip nb">neighbour</span>';
     case "verify-failed": return '<span class="chip bad">tampered</span>';
     case "error": return '<span class="chip bad">error</span>';
     case "upstream": return '<span class="chip bad">upstream</span>';
@@ -542,6 +558,11 @@ function renderHistorySummary(s) {
   chips.push(`<span class="hstat green"><b>${fmtBytes(s.bytesSaved)}</b> saved</span>`);
   chips.push(`<span class="hstat"><b>${fmtBytes(s.bytesDown)}</b> served</span>`);
   chips.push(`<span class="hstat"><b>${fmtBytes(s.bytesUp)}</b> upstream</span>`);
+  if ((s.neighbourHits || 0) > 0 || (s.neighbourMisses || 0) > 0) {
+    chips.push(
+      `<span class="hstat"><b>${fmtNum(s.neighbourHits || 0)}</b> neighbour hits · <b>${fmtBytes(s.bytesNeighbour || 0)}</b> from peers</span>`
+    );
+  }
   if (s.verifyFailures > 0) {
     chips.push(`<span class="hstat"><b>${fmtNum(s.verifyFailures)}</b> refusals</span>`);
   }

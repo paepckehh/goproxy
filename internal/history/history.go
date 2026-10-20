@@ -75,7 +75,10 @@ func migrate(db *sql.DB) error {
 			verify_failures INTEGER NOT NULL DEFAULT 0,
 			bytes_down INTEGER NOT NULL DEFAULT 0,
 			bytes_up INTEGER NOT NULL DEFAULT 0,
-			bytes_saved INTEGER NOT NULL DEFAULT 0
+			bytes_saved INTEGER NOT NULL DEFAULT 0,
+			bytes_neighbour INTEGER NOT NULL DEFAULT 0,
+			neighbour_hits INTEGER NOT NULL DEFAULT 0,
+			neighbour_misses INTEGER NOT NULL DEFAULT 0
 		)`,
 		`INSERT OR IGNORE INTO totals (id) VALUES (0)`,
 		`CREATE TABLE IF NOT EXISTS buckets (
@@ -89,6 +92,9 @@ func migrate(db *sql.DB) error {
 			bytes_down INTEGER NOT NULL,
 			bytes_up INTEGER NOT NULL,
 			bytes_saved INTEGER NOT NULL,
+			bytes_neighbour INTEGER NOT NULL DEFAULT 0,
+			neighbour_hits INTEGER NOT NULL DEFAULT 0,
+			neighbour_misses INTEGER NOT NULL DEFAULT 0,
 			store_bytes INTEGER NOT NULL,
 			store_modules INTEGER NOT NULL,
 			store_versions INTEGER NOT NULL,
@@ -109,6 +115,59 @@ func migrate(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS events_time ON events (time)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("history: migrate: %w", err)
+		}
+	}
+	// Databases created by older releases gain the neighbour-cache
+	// counters in place; their existing rows default to zero.
+	for _, table := range []string{"totals", "buckets"} {
+		if err := ensureColumns(db, table, neighbourColumns); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// neighbourColumns track traffic served by neighbour caches. They live in
+// both the lifetime totals and the minute buckets.
+var neighbourColumns = []struct{ name, decl string }{
+	{"bytes_neighbour", "INTEGER NOT NULL DEFAULT 0"},
+	{"neighbour_hits", "INTEGER NOT NULL DEFAULT 0"},
+	{"neighbour_misses", "INTEGER NOT NULL DEFAULT 0"},
+}
+
+// ensureColumns adds missing columns to an existing table, so a schema
+// upgrade never requires dropping the accumulated statistics.
+func ensureColumns(db *sql.DB, table string, cols []struct{ name, decl string }) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return fmt.Errorf("history: migrate: %w", err)
+	}
+	have := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid, notNull, pk int
+			name, decl       string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &decl, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("history: migrate: %w", err)
+		}
+		have[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("history: migrate: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("history: migrate: %w", err)
+	}
+	for _, c := range cols {
+		if have[c.name] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + c.name + ` ` + c.decl); err != nil {
 			return fmt.Errorf("history: migrate: %w", err)
 		}
 	}
@@ -155,11 +214,13 @@ func saveTotalsTx(tx interface {
 	_, err := tx.Exec(`UPDATE totals SET
 			requests = ?, hits = ?, misses = ?, passes = ?,
 			verifications = ?, verify_failures = ?,
-			bytes_down = ?, bytes_up = ?, bytes_saved = ?
+			bytes_down = ?, bytes_up = ?, bytes_saved = ?,
+			bytes_neighbour = ?, neighbour_hits = ?, neighbour_misses = ?
 		WHERE id = 0`,
 		t.Requests, t.Hits, t.Misses, t.Passes,
 		t.Verifications, t.VerifyFailures,
-		t.BytesDown, t.BytesUp, t.BytesSaved)
+		t.BytesDown, t.BytesUp, t.BytesSaved,
+		t.BytesNeighbour, t.NeighbourHits, t.NeighbourMisses)
 	if err != nil {
 		return fmt.Errorf("history: totals: %w", err)
 	}
@@ -170,11 +231,13 @@ func saveTotalsTx(tx interface {
 func (d *DB) LoadTotals() (stats.Totals, error) {
 	var t stats.Totals
 	err := d.db.QueryRow(`SELECT requests, hits, misses, passes,
-			verifications, verify_failures, bytes_down, bytes_up, bytes_saved
+			verifications, verify_failures, bytes_down, bytes_up, bytes_saved,
+			bytes_neighbour, neighbour_hits, neighbour_misses
 		FROM totals WHERE id = 0`).
 		Scan(&t.Requests, &t.Hits, &t.Misses, &t.Passes,
 			&t.Verifications, &t.VerifyFailures,
-			&t.BytesDown, &t.BytesUp, &t.BytesSaved)
+			&t.BytesDown, &t.BytesUp, &t.BytesSaved,
+			&t.BytesNeighbour, &t.NeighbourHits, &t.NeighbourMisses)
 	if err != nil {
 		return stats.Totals{}, fmt.Errorf("history: load totals: %w", err)
 	}
@@ -190,8 +253,9 @@ func (d *DB) RecordBucket(b stats.Bucket) error {
 			bucket, requests, hits, misses, passes,
 			verifications, verify_failures,
 			bytes_down, bytes_up, bytes_saved,
+			bytes_neighbour, neighbour_hits, neighbour_misses,
 			store_bytes, store_modules, store_versions, store_files
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (bucket) DO UPDATE SET
 			requests = requests + excluded.requests,
 			hits = hits + excluded.hits,
@@ -202,6 +266,9 @@ func (d *DB) RecordBucket(b stats.Bucket) error {
 			bytes_down = bytes_down + excluded.bytes_down,
 			bytes_up = bytes_up + excluded.bytes_up,
 			bytes_saved = bytes_saved + excluded.bytes_saved,
+			bytes_neighbour = bytes_neighbour + excluded.bytes_neighbour,
+			neighbour_hits = neighbour_hits + excluded.neighbour_hits,
+			neighbour_misses = neighbour_misses + excluded.neighbour_misses,
 			store_bytes = excluded.store_bytes,
 			store_modules = excluded.store_modules,
 			store_versions = excluded.store_versions,
@@ -209,6 +276,7 @@ func (d *DB) RecordBucket(b stats.Bucket) error {
 		key, b.Requests, b.Hits, b.Misses, b.Passes,
 		b.Verifications, b.VerifyFailures,
 		b.BytesDown, b.BytesUp, b.BytesSaved,
+		b.BytesNeighbour, b.NeighbourHits, b.NeighbourMisses,
 		b.Store.Bytes, b.Store.Modules, b.Store.Versions, b.Store.Files)
 	if err != nil {
 		return fmt.Errorf("history: bucket: %w", err)
@@ -287,18 +355,21 @@ func (d *DB) RecentEvents(n int) ([]stats.Event, error) {
 
 // Point is one aggregated history slot for the dashboard.
 type Point struct {
-	Time           time.Time `json:"time"`
-	Requests       int64     `json:"requests"`
-	Hits           int64     `json:"hits"`
-	Misses         int64     `json:"misses"`
-	Passes         int64     `json:"passes"`
-	Verifications  int64     `json:"verifications"`
-	VerifyFailures int64     `json:"verifyFailures"`
-	BytesDown      int64     `json:"bytesDown"`
-	BytesUp        int64     `json:"bytesUp"`
-	BytesSaved     int64     `json:"bytesSaved"`
-	StoreBytes     int64     `json:"storeBytes"`
-	StoreModules   int64     `json:"storeModules"`
+	Time            time.Time `json:"time"`
+	Requests        int64     `json:"requests"`
+	Hits            int64     `json:"hits"`
+	Misses          int64     `json:"misses"`
+	Passes          int64     `json:"passes"`
+	Verifications   int64     `json:"verifications"`
+	VerifyFailures  int64     `json:"verifyFailures"`
+	BytesDown       int64     `json:"bytesDown"`
+	BytesUp         int64     `json:"bytesUp"`
+	BytesSaved      int64     `json:"bytesSaved"`
+	BytesNeighbour  int64     `json:"bytesNeighbour"`
+	NeighbourHits   int64     `json:"neighbourHits"`
+	NeighbourMisses int64     `json:"neighbourMisses"`
+	StoreBytes      int64     `json:"storeBytes"`
+	StoreModules    int64     `json:"storeModules"`
 }
 
 // Series aggregates minute buckets between from (inclusive) and to
@@ -313,6 +384,7 @@ func (d *DB) Series(from, to time.Time, res time.Duration) ([]Point, error) {
 			SUM(requests), SUM(hits), SUM(misses), SUM(passes),
 			SUM(verifications), SUM(verify_failures),
 			SUM(bytes_down), SUM(bytes_up), SUM(bytes_saved),
+			SUM(bytes_neighbour), SUM(neighbour_hits), SUM(neighbour_misses),
 			MAX(store_bytes), MAX(store_modules)
 		FROM buckets
 		WHERE bucket >= ? AND bucket < ?
@@ -329,6 +401,7 @@ func (d *DB) Series(from, to time.Time, res time.Duration) ([]Point, error) {
 		if err := rows.Scan(&slot, &p.Requests, &p.Hits, &p.Misses, &p.Passes,
 			&p.Verifications, &p.VerifyFailures,
 			&p.BytesDown, &p.BytesUp, &p.BytesSaved,
+			&p.BytesNeighbour, &p.NeighbourHits, &p.NeighbourMisses,
 			&p.StoreBytes, &p.StoreModules); err != nil {
 			return nil, fmt.Errorf("history: series: %w", err)
 		}
@@ -340,17 +413,20 @@ func (d *DB) Series(from, to time.Time, res time.Duration) ([]Point, error) {
 
 // Summary aggregates one time range for the dashboard.
 type Summary struct {
-	Requests       int64 `json:"requests"`
-	Hits           int64 `json:"hits"`
-	Misses         int64 `json:"misses"`
-	Passes         int64 `json:"passes"`
-	Verifications  int64 `json:"verifications"`
-	VerifyFailures int64 `json:"verifyFailures"`
-	BytesDown      int64 `json:"bytesDown"`
-	BytesUp        int64 `json:"bytesUp"`
-	BytesSaved     int64 `json:"bytesSaved"`
-	StoreStart     int64 `json:"storeStart"` // first observed store size
-	StoreEnd       int64 `json:"storeEnd"`   // last observed store size
+	Requests        int64 `json:"requests"`
+	Hits            int64 `json:"hits"`
+	Misses          int64 `json:"misses"`
+	Passes          int64 `json:"passes"`
+	Verifications   int64 `json:"verifications"`
+	VerifyFailures  int64 `json:"verifyFailures"`
+	BytesDown       int64 `json:"bytesDown"`
+	BytesUp         int64 `json:"bytesUp"`
+	BytesSaved      int64 `json:"bytesSaved"`
+	BytesNeighbour  int64 `json:"bytesNeighbour"`
+	NeighbourHits   int64 `json:"neighbourHits"`
+	NeighbourMisses int64 `json:"neighbourMisses"`
+	StoreStart      int64 `json:"storeStart"` // first observed store size
+	StoreEnd        int64 `json:"storeEnd"`   // last observed store size
 }
 
 // RangeSummary aggregates the buckets between from (inclusive) and to
@@ -364,6 +440,9 @@ func (d *DB) RangeSummary(from, to time.Time) (Summary, error) {
 			COALESCE(SUM(verifications), 0), COALESCE(SUM(verify_failures), 0),
 			COALESCE(SUM(bytes_down), 0), COALESCE(SUM(bytes_up), 0),
 			COALESCE(SUM(bytes_saved), 0),
+			COALESCE(SUM(bytes_neighbour), 0),
+			COALESCE(SUM(neighbour_hits), 0),
+			COALESCE(SUM(neighbour_misses), 0),
 			(SELECT store_bytes FROM buckets
 			 WHERE bucket >= ? AND bucket < ?
 			 ORDER BY bucket LIMIT 1),
@@ -374,7 +453,9 @@ func (d *DB) RangeSummary(from, to time.Time) (Summary, error) {
 		from.Unix(), to.Unix(), from.Unix(), to.Unix(), from.Unix(), to.Unix()).
 		Scan(&s.Requests, &s.Hits, &s.Misses, &s.Passes,
 			&s.Verifications, &s.VerifyFailures,
-			&s.BytesDown, &s.BytesUp, &s.BytesSaved, &first, &last)
+			&s.BytesDown, &s.BytesUp, &s.BytesSaved,
+			&s.BytesNeighbour, &s.NeighbourHits, &s.NeighbourMisses,
+			&first, &last)
 	if err != nil {
 		return Summary{}, fmt.Errorf("history: range summary: %w", err)
 	}

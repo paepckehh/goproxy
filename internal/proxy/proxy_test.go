@@ -131,7 +131,7 @@ func newTestEnv(t *testing.T, gosum func(path, ver string) ([]byte, error)) *tes
 		t.Fatal(err)
 	}
 	m := stats.New(nil)
-	p, err := New(st, db, m, upstream.URL, true, upstream.Client(), slog.New(slog.DiscardHandler))
+	p, err := New(st, db, m, upstream.URL, nil, true, upstream.Client(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestProxy_InfoVersionValidated(t *testing.T) {
 			}))
 			t.Cleanup(upstream.Close)
 
-			p, err := New(env.store, env.sumdbDB, env.stats, upstream.URL, false, upstream.Client(), slog.New(slog.DiscardHandler))
+			p, err := New(env.store, env.sumdbDB, env.stats, upstream.URL, nil, false, upstream.Client(), slog.New(slog.DiscardHandler))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -408,7 +408,7 @@ func TestProxy_UnknownToChecksumDBServesUnverified(t *testing.T) {
 	t.Cleanup(upstream.Close)
 
 	m := stats.New(nil)
-	p, err := New(st, db, m, upstream.URL, true, upstream.Client(), slog.New(slog.DiscardHandler))
+	p, err := New(st, db, m, upstream.URL, nil, true, upstream.Client(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -493,7 +493,7 @@ func TestProxy_EscapedModulePath(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := stats.New(nil)
-	p, err := New(st, db, m, upstream.URL, true, upstream.Client(), slog.New(slog.DiscardHandler))
+	p, err := New(st, db, m, upstream.URL, nil, true, upstream.Client(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -526,7 +526,7 @@ func TestProxy_SingleflightDeduplicates(t *testing.T) {
 	}))
 	t.Cleanup(slow.Close)
 
-	p, err := New(env.store, env.sumdbDB, env.stats, slow.URL, false, slow.Client(), slog.New(slog.DiscardHandler))
+	p, err := New(env.store, env.sumdbDB, env.stats, slow.URL, nil, false, slow.Client(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -579,7 +579,7 @@ func TestProxy_ClientDisconnectDoesNotAbortFetch(t *testing.T) {
 	}))
 	t.Cleanup(slow.Close)
 
-	p, err := New(env.store, env.sumdbDB, env.stats, slow.URL, false, slow.Client(), slog.New(slog.DiscardHandler))
+	p, err := New(env.store, env.sumdbDB, env.stats, slow.URL, nil, false, slow.Client(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -678,7 +678,7 @@ func TestProxy_SumDBNameWithPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := New(st, db, stats.New(nil), "http://upstream.invalid", false, sumSrv.Client(), slog.New(slog.DiscardHandler))
+	p, err := New(st, db, stats.New(nil), "http://upstream.invalid", nil, false, sumSrv.Client(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -723,7 +723,7 @@ func TestCountingWriterReadFrom(t *testing.T) {
 func TestNewRejectsBadUpstream(t *testing.T) {
 	t.Parallel()
 	for _, upstream := range []string{"", "not a url", "ftp://x"} {
-		if _, err := New(nil, nil, nil, upstream, true, nil, nil); err == nil {
+		if _, err := New(nil, nil, nil, upstream, nil, true, nil, nil); err == nil {
 			t.Errorf("New(%q) succeeded, want error", upstream)
 		}
 	}
@@ -740,7 +740,7 @@ func TestProxy_UpstreamUnreachableFailsClosed(t *testing.T) {
 	dead.Close()
 
 	var logs bytes.Buffer
-	p, err := New(env.store, env.sumdbDB, env.stats, url, true, &http.Client{Timeout: 2 * time.Second}, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	p, err := New(env.store, env.sumdbDB, env.stats, url, nil, true, &http.Client{Timeout: 2 * time.Second}, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -767,7 +767,7 @@ func TestProxy_UpstreamUnreachablePassthroughLogged(t *testing.T) {
 	dead.Close()
 
 	var logs bytes.Buffer
-	p, err := New(env.store, env.sumdbDB, env.stats, url, true, &http.Client{Timeout: 2 * time.Second}, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	p, err := New(env.store, env.sumdbDB, env.stats, url, nil, true, &http.Client{Timeout: 2 * time.Second}, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -794,7 +794,7 @@ func TestProxy_UpstreamErrorStatusLogged(t *testing.T) {
 	t.Cleanup(broken.Close)
 
 	var logs bytes.Buffer
-	p, err := New(env.store, env.sumdbDB, env.stats, broken.URL, true, broken.Client(), slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	p, err := New(env.store, env.sumdbDB, env.stats, broken.URL, nil, true, broken.Client(), slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -824,7 +824,7 @@ func TestProxy_RoutineFailuresSilentAtDefaultLevel(t *testing.T) {
 	t.Cleanup(broken.Close)
 
 	var logs bytes.Buffer
-	p, err := New(env.store, env.sumdbDB, env.stats, broken.URL, true, broken.Client(),
+	p, err := New(env.store, env.sumdbDB, env.stats, broken.URL, nil, true, broken.Client(),
 		slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	if err != nil {
 		t.Fatal(err)

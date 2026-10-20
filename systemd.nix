@@ -24,6 +24,11 @@ in {
       default = "/nix/persist/cache/go/proxy";
       description = "Module cache directory; keep it separate from the stats state directory.";
     };
+    neighbourCaches = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "Base URLs of neighbouring goproxy instances asked in parallel before the upstream.";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -48,6 +53,8 @@ in {
       environment = {
         BIND_ADDR = "${cfg.host}:${toString cfg.port}";
         CACHE_ROOT = cfg.root;
+      } // lib.optionalAttrs (cfg.neighbourCaches != [ ]) {
+        NEIGHBOUR_CACHES = lib.concatStringsSep "," cfg.neighbourCaches;
       };
       serviceConfig = {
         ExecStart = cfg.bin;

@@ -3,11 +3,13 @@
 `paepcke.de/goproxy` — single-binary go proxy, public mirror at
 github.com/paepckehh/goproxy, BSD-3-Clause (see LICENSE).
 - modern single binary, cgo and runtime dependency free
-- fast: modern caching go mod proxy
+- fast: modern caching go mod proxy; a fleet chains warm caches via
+  NEIGHBOUR_CACHES (parallel peer lookup before the upstream)
 - secure: validates upstream signatures
 - cool: modern 3D animated business-like dashboard about packages, sources,
-  cache hits/misses, upstream and downstream bandwidth used and saved, store
-  size, plus long-term (24h to all-time) history charts
+  cache hits/misses, neighbour-cache hits and peer bandwidth, upstream and
+  downstream bandwidth used and saved, store size, plus long-term (24h to
+  all-time) history charts
 - persistent: long-term stats in the SQLite stats database via the pure-Go
   cgo-free driver `modernc.org/sqlite`; lifetime counters, minute-resolution
   buckets and the event log all survive reboots
@@ -23,8 +25,8 @@ internal/store       disk cache (standard download/ layout) + in-memory index
 internal/sumdb       checksum-database verification (x/mod sumdb client)
 internal/stats       lock-free counters, event ring, traffic buckets, recorder flush loop
 internal/history      long-term stats in SQLite (pure-Go driver, WAL, minute buckets)
-internal/proxy       GOPROXY protocol handlers (singleflight, verify, cache,
-                     fetches detached from client contexts)
+internal/proxy       GOPROXY protocol handlers (singleflight, neighbour-first
+                     fetch, verify, cache; fetches detached from client contexts)
 internal/ui          embedded dashboard (static/, vanilla JS, no external assets);
                      all updates pushed over SSE (/api/events), no polling
                      while the stream is open
@@ -70,6 +72,19 @@ clean.
 Security refusals (tampered content) and warnings stay at Error/Warn.
 Startup state, warnings and the surfaced dashboard event feed remain
 visible without DEBUG.
+
+Neighbour caches: `NEIGHBOUR_CACHES` (comma/whitespace separated base URLs)
+optionally points a proxy at other goproxy instances. On a cache miss every
+neighbour is asked in parallel via the plain GOPROXY route; the first 200
+wins and the losing requests are cancelled (their response headers are
+bounded to `neighbourHeaderTimeout` = 5s, bodies stream without a limit).
+Only a full peer miss reaches the upstream. Entries are validated at
+startup (http/https + host) and duplicates are dropped; a proxy must not
+list itself. Neighbour content is verified exactly like upstream content,
+so peers are never trusted. Stats count a peer-served request as a local
+miss plus a neighbour hit, with peer bytes tracked separately from upstream
+bytes (`NeighbourHits`, `NeighbourMisses`, `BytesNeighbour`), persisted in
+the totals and minute buckets and shown on the dashboard.
 
 Security: misses are verified against sum.golang.org (note signature + tlog
 tree + tiles) before caching; a hash mismatch refuses content (502); no
@@ -134,8 +149,9 @@ never aspirational.
 
 `systemd.nix` is a NixOS module fragment (same consumption pattern as
 ../zdash/systemd.nix, host infra flake modules list) exposing
-`services.go-mod-proxy.{enable,bin,host,port,root}`. It deliberately runs a
-PERSISTENT server (`wantedBy = multi-user.target`, `Restart = always`,
+`services.go-mod-proxy.{enable,bin,host,port,root,neighbourCaches}`;
+`neighbourCaches` becomes `NEIGHBOUR_CACHES` when non-empty. It
+deliberately runs a PERSISTENT server (`wantedBy = multi-user.target`, `Restart = always`,
 network-online ordering), NOT socket activation: fleet toolchains must find
 the proxy alive at any build time. Restarts are rate-limited (3 starts per
 30s): a crashing binary ends in `failed` within seconds instead of

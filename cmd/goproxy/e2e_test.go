@@ -80,7 +80,7 @@ func TestE2E_FullStackFetchesRealModule(t *testing.T) {
 			t.Errorf("closing stats db: %v", err)
 		}
 	})
-	p, err := proxy.New(st, db, m, "https://proxy.golang.org", true, moduleClient(),
+	p, err := proxy.New(st, db, m, "https://proxy.golang.org", nil, true, moduleClient(),
 		slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)

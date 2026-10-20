@@ -19,9 +19,11 @@ Single binary &middot; zero cgo &middot; SQLite-backed long-term statistics
 ---
 
 Point your toolchain at goproxy and every module download flows through a
-local cache. Point a browser at it and watch the cache work: hit ratio,
-bandwidth saved, upstream and downstream traffic, top modules, a live event
-feed, and long-term history charts from 24 hours to all time.
+local cache. A fleet can chain proxies: a miss asks the configured neighbour
+caches in parallel before it reaches the upstream, so warm caches are shared.
+Point a browser at it and watch the cache work: hit ratio, bandwidth saved,
+upstream, downstream and neighbour traffic, top modules, a live event feed,
+and long-term history charts from 24 hours to all time.
 
 Everything a fleet of build machines needs, in one dependency-free binary.
 
@@ -29,7 +31,8 @@ Everything a fleet of build machines needs, in one dependency-free binary.
 
 | Category | What you get |
 | --- | --- |
-| **Fast** | In-memory index over a standard `download/` layout, singleflight download dedup, atomic cache commits, `sendfile`-backed serving, negative caching of upstream 404s |
+| **Fast** | In-memory index over a standard `download/` layout, singleflight download dedup, atomic cache commits, `sendfile`-backed serving, negative caching of upstream 404s, parallel neighbour-cache lookup before the upstream |
+| **Shared** | `NEIGHBOUR_CACHES` chains goproxy instances: a cache miss asks every peer in parallel (short header timeout), the first copy wins, the rest are cancelled, and only a full peer miss falls through to the upstream |
 | **Secure** | Every `.zip` and `.mod` is hash-verified against the signed sum.golang.org checksum database: Ed25519 note signature, transparency-log tree consistency, and tile inclusion proofs. Tampered content is refused, never cached |
 | **Observable** | Embedded dashboard with zero external assets, pushed live over one SSE stream (counters, cache table, events, history): hit ratio, bandwidth saved, traffic, store usage, a 3D top-modules chart with a fixed (non-rotating) name agenda, live event feed, and 24h to all-time history charts |
 | **Persistent** | Lifetime counters, minute-resolution buckets and the event log survive reboots in SQLite (pure-Go driver, WAL journaling) |
@@ -91,7 +94,8 @@ Flags (environment variables are used by the systemd units; flags win over env):
 | `CACHE_ROOT` | module cache directory, e.g. a dedicated disk (`-root` flag wins, then this, then `cache`) |
 | `SOCKET_ACTIVATION=1` | serve on the sockets systemd passed via the `LISTEN_FDS` protocol; if none were passed, log a warning and fall back to `BIND_ADDR` |
 | `EXIT_ON_IDLE=1` | exit cleanly once no request has been in flight for 30s; only honored in socket-activated mode, where systemd re-arms the socket and restarts the proxy on the next connection |
-| `DEBUG=1` | enable verbose per-request logging: one access line per request plus routine failure detail (upstream 404s, checksum-db probes, unverified private modules). Without it the journal only carries startup state, warnings and security refusals |
+| `NEIGHBOUR_CACHES` | comma- or whitespace-separated base URLs of neighbouring goproxy instances (e.g. `http://goproxy1:9090,http://goproxy2:9090`); cache misses ask them all in parallel before the upstream |
+| `DEBUG=1` | enable verbose per-request logging: one access line per request plus routine failure detail (upstream 404s, neighbour misses, checksum-db probes, unverified private modules). Without it the journal only carries startup state, warnings and security refusals |
 
 ## API reference
 
@@ -103,7 +107,7 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 | `GET /<module>/@latest` | forwarded upstream (`no-store`) |
 | `GET /<module>/@v/<v>.info` | cached, JSON-validated |
 | `GET /<module>/@v/<v>.mod` | cached, hash-verified against the checksum database |
-| `GET /<module>/@v/<v>.zip` | cached, hash-verified against the checksum database |
+| `GET /<module>/@v/<v>.zip` | cached, hash-verified against the checksum database; on a miss the neighbour caches are asked in parallel first |
 | `GET /sumdb/<db>/...` | forwarded verbatim to the configured database only (404 otherwise), with the `/supported` probe answered locally, so go clients run their full verification through the proxy |
 | `GET /` | operations dashboard (all updates pushed over SSE; polling only as a no-EventSource fallback) |
 | `GET /api/dashboard` | JSON snapshot: stats, store, modules, events |
@@ -116,7 +120,9 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 ```
  go tool ──► goproxy ──► cache hit ──► sendfile from disk
               │
-              └─ miss ─► singleflight fetch ──► upstream proxy
+              └─ miss ─► singleflight fetch ──► neighbour caches (parallel)
+                            │                     └─ first copy wins,
+                            ├─ no peer has it ──► upstream proxy
                             │
                             └─ verify against sum.golang.org
                                (note signature + tree + tiles)
@@ -129,7 +135,7 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 | `cmd/goproxy` | entrypoint: flags, env wiring, socket activation, idle exit, graceful shutdown |
 | `internal/store` | disk cache (standard `download/` layout) plus in-memory index |
 | `internal/sumdb` | checksum-database verification (`golang.org/x/mod/sumdb` client) |
-| `internal/proxy` | GOPROXY protocol handlers: singleflight, verify, cache; fetches detached from client contexts |
+| `internal/proxy` | GOPROXY protocol handlers: singleflight, neighbour-first fetch, verify, cache; fetches detached from client contexts |
 | `internal/stats` | lock-free counters, event ring, traffic buckets, recorder flush loop |
 | `internal/history` | long-term stats in SQLite (pure-Go driver, WAL, minute buckets) |
 | `internal/ui` | embedded dashboard (static files, vanilla JS, no external assets) |
@@ -139,6 +145,27 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 Shared singleflight fetches are detached from the requesting client's
 context: one disconnecting client cannot abort a download other waiters
 share, and a completed download still warms the cache.
+
+## Neighbour caches
+
+`NEIGHBOUR_CACHES` points one goproxy at the cache of others. On a cache
+miss the proxy asks every listed neighbour in parallel
+(`http://goproxy1:9090,http://goproxy2:9090`); the first `200` wins and the
+other lookups are cancelled, so one slow or dead peer cannot delay the
+fetch (their headers are bounded to 5s, bodies stream freely). Only when no
+neighbour has the file does the request continue to the upstream proxy.
+
+Peer content is untrusted exactly like upstream content: it is verified
+against the signed checksum database before it is cached or served, so a
+misconfigured or hostile neighbour cannot inject code. The dashboard counts
+those requests as **neighbour hits** (still a local cache miss, because the
+local index was cold) and tracks bytes pulled from peers separately from
+upstream bytes in the lifetime counters, the minute buckets and the history
+views. A neighbour must not list itself; duplicate entries are ignored.
+
+```sh
+NEIGHBOUR_CACHES=http://goproxy1:9090,http://goproxy2:9090 ./goproxy
+```
 
 ## Storage model
 
@@ -185,7 +212,8 @@ Everything the dashboard shows survives reboots. The stats database is a
 SQLite file written by the pure-Go, cgo-free driver (`modernc.org/sqlite`,
 WAL journaling), so the single binary stays cgo-free. It holds:
 
-- **lifetime totals**: restored at startup, continued, never reset
+- **lifetime totals**: restored at startup, continued, never reset;
+  including neighbour-cache hits/misses and peer bandwidth
 - **one bucket per minute** of requests, hits, misses, bytes up/down/saved,
   verifications and cache-store size snapshots; kept forever (~half a
   million rows per year), aggregated into the 24h/7d/30d/1y and all-time
@@ -230,6 +258,10 @@ services.go-mod-proxy = {
   enable = true;
   host = "127.0.0.1";          # behind the caddy reverse proxy
   port = 7040;                 # infra.localhost.port.offset + app id
+  neighbourCaches = [         # optional: share warm caches across the fleet
+    "http://goproxy1:9090"
+    "http://goproxy2:9090"
+  ];
 };
 ```
 

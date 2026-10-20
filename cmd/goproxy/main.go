@@ -86,7 +86,8 @@ func main() {
 		}
 	}))
 	m.Seed(totals, feed)
-	p, err := proxy.New(st, db, m, *upstream, *verify, moduleClient(), log)
+	neighbours := envList("NEIGHBOUR_CACHES")
+	p, err := proxy.New(st, db, m, *upstream, neighbours, *verify, moduleClient(), log)
 	if err != nil {
 		log.Error("startup", "err", err)
 		os.Exit(1)
@@ -177,7 +178,7 @@ func main() {
 
 	log.Info("listening", "addr", serveDesc, "socket-activated", socketActivated,
 		"exit-on-idle", exitOnIdle, "version", ver, "root", st.Root(), "stats-db", dbPath,
-		"upstream", *upstream, "sumdb", *sumdbURL, "verify", *verify)
+		"upstream", *upstream, "neighbours", neighbours, "sumdb", *sumdbURL, "verify", *verify)
 
 	exitCode := 0
 	select {
@@ -265,6 +266,14 @@ func logLevel(debug bool) slog.Level {
 		return slog.LevelDebug
 	}
 	return slog.LevelInfo
+}
+
+// envList splits an environment variable into a list. Commas and
+// whitespace both separate entries, so NEIGHBOUR_CACHES accepts
+// "http://a:9090,http://b:9090" as well as space- or newline separated
+// values.
+func envList(name string) []string {
+	return strings.Fields(strings.ReplaceAll(os.Getenv(name), ",", " "))
 }
 
 // envBool reports whether an environment variable holds a truthy value.

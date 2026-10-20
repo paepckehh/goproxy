@@ -79,7 +79,7 @@ func newE2EProxy(t *testing.T) (*Proxy, *store.Store, *stats.Stats) {
 		cancel()
 		<-done
 	})
-	p, err := New(st, db, m, e2eUpstreamURL, true, client, slog.New(slog.DiscardHandler))
+	p, err := New(st, db, m, e2eUpstreamURL, nil, true, client, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}

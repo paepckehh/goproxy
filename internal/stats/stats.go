@@ -47,15 +47,18 @@ type Traffic struct {
 
 // Totals are the lifetime operational counters.
 type Totals struct {
-	Requests       int64 `json:"requests"`
-	Hits           int64 `json:"hits"`
-	Misses         int64 `json:"misses"`
-	Passes         int64 `json:"passes"`
-	BytesDown      int64 `json:"bytesDown"`
-	BytesUp        int64 `json:"bytesUp"`
-	BytesSaved     int64 `json:"bytesSaved"`
-	Verifications  int64 `json:"verifications"`
-	VerifyFailures int64 `json:"verifyFailures"`
+	Requests        int64 `json:"requests"`
+	Hits            int64 `json:"hits"`
+	Misses          int64 `json:"misses"`
+	Passes          int64 `json:"passes"`
+	BytesDown       int64 `json:"bytesDown"`
+	BytesUp         int64 `json:"bytesUp"`
+	BytesSaved      int64 `json:"bytesSaved"`
+	BytesNeighbour  int64 `json:"bytesNeighbour"`
+	Verifications   int64 `json:"verifications"`
+	VerifyFailures  int64 `json:"verifyFailures"`
+	NeighbourHits   int64 `json:"neighbourHits"`
+	NeighbourMisses int64 `json:"neighbourMisses"`
 }
 
 // StoreStat is a point-in-time snapshot of the cache store size, sampled
@@ -110,17 +113,20 @@ type Stats struct {
 	started time.Time
 	rec     Recorder
 
-	requests      atomic.Int64
-	hits          atomic.Int64
-	misses        atomic.Int64
-	passes        atomic.Int64
-	bytesDown     atomic.Int64
-	bytesUp       atomic.Int64
-	bytesSaved    atomic.Int64
-	verifications atomic.Int64
-	verifyFailed  atomic.Int64
-	dropped       atomic.Int64
-	dbErrs        atomic.Int64
+	requests        atomic.Int64
+	hits            atomic.Int64
+	misses          atomic.Int64
+	passes          atomic.Int64
+	bytesDown       atomic.Int64
+	bytesUp         atomic.Int64
+	bytesSaved      atomic.Int64
+	bytesNeighbour  atomic.Int64
+	neighbourHits   atomic.Int64
+	neighbourMisses atomic.Int64
+	verifications   atomic.Int64
+	verifyFailed    atomic.Int64
+	dropped         atomic.Int64
+	dbErrs          atomic.Int64
 
 	evCh      chan Event
 	evMu      sync.Mutex
@@ -197,6 +203,9 @@ func (s *Stats) Seed(t Totals, newestFirst []Event) {
 	s.bytesDown.Add(t.BytesDown)
 	s.bytesUp.Add(t.BytesUp)
 	s.bytesSaved.Add(t.BytesSaved)
+	s.bytesNeighbour.Add(t.BytesNeighbour)
+	s.neighbourHits.Add(t.NeighbourHits)
+	s.neighbourMisses.Add(t.NeighbourMisses)
 	s.verifications.Add(t.Verifications)
 	s.verifyFailed.Add(t.VerifyFailures)
 	s.evMu.Lock()
@@ -384,6 +393,31 @@ func (s *Stats) Miss(mod, ver, kind string, fetched, served int64, dur time.Dura
 	})
 }
 
+// NeighbourHit records a cache miss satisfied by a neighbouring goproxy,
+// so no upstream bandwidth was used. It counts as a local miss (the cache
+// was cold) and as a neighbour hit.
+func (s *Stats) NeighbourHit(mod, ver, kind string, fetched, served int64, dur time.Duration, verified bool, source string) {
+	s.requests.Add(1)
+	s.misses.Add(1)
+	s.neighbourHits.Add(1)
+	s.bytesNeighbour.Add(fetched)
+	s.bytesDown.Add(served)
+	if verified {
+		s.verifications.Add(1)
+	}
+	s.send(Event{
+		Time: time.Now().UTC(), Module: mod, Version: ver, Kind: kind,
+		Result: "neighbour", Bytes: fetched, DurMS: dur.Milliseconds(),
+		Detail: "from neighbour " + source + "; " + verifiedText(verified),
+	})
+}
+
+// NeighbourMiss records that the configured neighbour caches had no copy
+// and the request fell back to the upstream proxy.
+func (s *Stats) NeighbourMiss() {
+	s.neighbourMisses.Add(1)
+}
+
 // Pass records a non-cacheable passthrough (list, latest, sumdb).
 func (s *Stats) Pass(mod, what string, size int64, dur time.Duration) {
 	s.requests.Add(1)
@@ -507,28 +541,34 @@ func (s *Stats) Snapshot() Snapshot {
 
 func (s *Stats) totals() Totals {
 	return Totals{
-		Requests:       s.requests.Load(),
-		Hits:           s.hits.Load(),
-		Misses:         s.misses.Load(),
-		Passes:         s.passes.Load(),
-		BytesDown:      s.bytesDown.Load(),
-		BytesUp:        s.bytesUp.Load(),
-		BytesSaved:     s.bytesSaved.Load(),
-		Verifications:  s.verifications.Load(),
-		VerifyFailures: s.verifyFailed.Load(),
+		Requests:        s.requests.Load(),
+		Hits:            s.hits.Load(),
+		Misses:          s.misses.Load(),
+		Passes:          s.passes.Load(),
+		BytesDown:       s.bytesDown.Load(),
+		BytesUp:         s.bytesUp.Load(),
+		BytesSaved:      s.bytesSaved.Load(),
+		BytesNeighbour:  s.bytesNeighbour.Load(),
+		Verifications:   s.verifications.Load(),
+		VerifyFailures:  s.verifyFailed.Load(),
+		NeighbourHits:   s.neighbourHits.Load(),
+		NeighbourMisses: s.neighbourMisses.Load(),
 	}
 }
 
 func subtract(a, b Totals) Totals {
 	return Totals{
-		Requests:       a.Requests - b.Requests,
-		Hits:           a.Hits - b.Hits,
-		Misses:         a.Misses - b.Misses,
-		Passes:         a.Passes - b.Passes,
-		BytesDown:      a.BytesDown - b.BytesDown,
-		BytesUp:        a.BytesUp - b.BytesUp,
-		BytesSaved:     a.BytesSaved - b.BytesSaved,
-		Verifications:  a.Verifications - b.Verifications,
-		VerifyFailures: a.VerifyFailures - b.VerifyFailures,
+		Requests:        a.Requests - b.Requests,
+		Hits:            a.Hits - b.Hits,
+		Misses:          a.Misses - b.Misses,
+		Passes:          a.Passes - b.Passes,
+		BytesDown:       a.BytesDown - b.BytesDown,
+		BytesUp:         a.BytesUp - b.BytesUp,
+		BytesSaved:      a.BytesSaved - b.BytesSaved,
+		BytesNeighbour:  a.BytesNeighbour - b.BytesNeighbour,
+		Verifications:   a.Verifications - b.Verifications,
+		VerifyFailures:  a.VerifyFailures - b.VerifyFailures,
+		NeighbourHits:   a.NeighbourHits - b.NeighbourHits,
+		NeighbourMisses: a.NeighbourMisses - b.NeighbourMisses,
 	}
 }

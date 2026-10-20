@@ -2,6 +2,7 @@ package history
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -25,8 +26,8 @@ func TestHistory_TotalsRoundtrip(t *testing.T) {
 	db := open(t)
 
 	want := stats.Totals{Requests: 42, Hits: 40, Misses: 1, Passes: 1,
-		BytesDown: 1234, BytesUp: 567, BytesSaved: 800,
-		Verifications: 1, VerifyFailures: 2}
+		BytesDown: 1234, BytesUp: 567, BytesSaved: 800, BytesNeighbour: 321,
+		Verifications: 1, VerifyFailures: 2, NeighbourHits: 7, NeighbourMisses: 3}
 	if err := db.SaveTotals(want); err != nil {
 		t.Fatal(err)
 	}
@@ -49,13 +50,15 @@ func TestHistory_BucketUpsertMerge(t *testing.T) {
 	minute := time.Now().UTC().Truncate(time.Minute)
 	first := stats.Bucket{
 		Bucket: minute,
-		Totals: stats.Totals{Requests: 3, Hits: 2, Misses: 1, BytesSaved: 100},
-		Store:  stats.StoreStat{Bytes: 1000, Modules: 10},
+		Totals: stats.Totals{Requests: 3, Hits: 2, Misses: 1, BytesSaved: 100,
+			BytesNeighbour: 40, NeighbourHits: 1, NeighbourMisses: 2},
+		Store: stats.StoreStat{Bytes: 1000, Modules: 10},
 	}
 	second := stats.Bucket{
 		Bucket: minute.Add(20 * time.Second), // same wall-clock minute
-		Totals: stats.Totals{Requests: 2, Hits: 2, BytesSaved: 50},
-		Store:  stats.StoreStat{Bytes: 2000, Modules: 12},
+		Totals: stats.Totals{Requests: 2, Hits: 2, BytesSaved: 50,
+			BytesNeighbour: 10, NeighbourHits: 1},
+		Store: stats.StoreStat{Bytes: 2000, Modules: 12},
 	}
 	if err := db.RecordBucket(first); err != nil {
 		t.Fatal(err)
@@ -126,8 +129,9 @@ func TestHistory_SeriesAggregation(t *testing.T) {
 		for m := range 2 {
 			b := stats.Bucket{
 				Bucket: base.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute),
-				Totals: stats.Totals{Requests: 1, Hits: 1, BytesSaved: 10},
-				Store:  stats.StoreStat{Bytes: int64(h+1) * 100},
+				Totals: stats.Totals{Requests: 1, Hits: 1, BytesSaved: 10,
+					BytesNeighbour: 5, NeighbourHits: 1},
+				Store: stats.StoreStat{Bytes: int64(h+1) * 100},
 			}
 			if err := db.RecordBucket(b); err != nil {
 				t.Fatal(err)
@@ -145,6 +149,10 @@ func TestHistory_SeriesAggregation(t *testing.T) {
 	for i, p := range pts {
 		if p.Requests != 2 || p.Hits != 2 || p.BytesSaved != 20 {
 			t.Errorf("point %d = %+v, want 2 requests/hits, 20 saved", i, p)
+		}
+		if p.BytesNeighbour != 10 || p.NeighbourHits != 2 {
+			t.Errorf("point %d neighbour = %d bytes / %d hits, want 10/2",
+				i, p.BytesNeighbour, p.NeighbourHits)
 		}
 		if !p.Time.Equal(base.Add(time.Duration(i) * time.Hour)) {
 			t.Errorf("point %d time = %v, want %v", i, p.Time, base.Add(time.Duration(i)*time.Hour))
@@ -172,8 +180,9 @@ func TestHistory_RangeSummaryAndBounds(t *testing.T) {
 	for m := range 4 {
 		b := stats.Bucket{
 			Bucket: base.Add(time.Duration(m) * time.Minute),
-			Totals: stats.Totals{Requests: 2, Hits: 1, Misses: 1, BytesSaved: 5},
-			Store:  stats.StoreStat{Bytes: 100 + int64(m)*10},
+			Totals: stats.Totals{Requests: 2, Hits: 1, Misses: 1, BytesSaved: 5,
+				BytesNeighbour: 7, NeighbourHits: 1, NeighbourMisses: 1},
+			Store: stats.StoreStat{Bytes: 100 + int64(m)*10},
 		}
 		if err := db.RecordBucket(b); err != nil {
 			t.Fatal(err)
@@ -186,6 +195,10 @@ func TestHistory_RangeSummaryAndBounds(t *testing.T) {
 	}
 	if s.Requests != 8 || s.Hits != 4 || s.Misses != 4 || s.BytesSaved != 20 {
 		t.Errorf("summary = %+v, want 8 requests, 4 hits/misses, 20 saved", s)
+	}
+	if s.BytesNeighbour != 28 || s.NeighbourHits != 4 || s.NeighbourMisses != 4 {
+		t.Errorf("summary neighbour = %d bytes / %d hits / %d misses, want 28/4/4",
+			s.BytesNeighbour, s.NeighbourHits, s.NeighbourMisses)
 	}
 	if s.StoreStart != 100 || s.StoreEnd != 130 {
 		t.Errorf("store %d -> %d, want 100 -> 130", s.StoreStart, s.StoreEnd)
@@ -505,4 +518,99 @@ func mustRecent(t *testing.T, db *DB, n int) []stats.Event {
 		t.Fatal(err)
 	}
 	return evs
+}
+
+// TestHistory_MigratesLegacySchema opens a database created before the
+// neighbour-cache counters existed: the missing columns are added in place
+// and the accumulated statistics survive the upgrade.
+func TestHistory_MigratesLegacySchema(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "stats.db")
+	legacy, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE totals (
+			id INTEGER PRIMARY KEY CHECK (id = 0),
+			requests INTEGER NOT NULL DEFAULT 0,
+			hits INTEGER NOT NULL DEFAULT 0,
+			misses INTEGER NOT NULL DEFAULT 0,
+			passes INTEGER NOT NULL DEFAULT 0,
+			verifications INTEGER NOT NULL DEFAULT 0,
+			verify_failures INTEGER NOT NULL DEFAULT 0,
+			bytes_down INTEGER NOT NULL DEFAULT 0,
+			bytes_up INTEGER NOT NULL DEFAULT 0,
+			bytes_saved INTEGER NOT NULL DEFAULT 0
+		)`,
+		`INSERT INTO totals (id, requests, hits, bytes_saved) VALUES (0, 7, 5, 900)`,
+		`CREATE TABLE buckets (
+			bucket INTEGER PRIMARY KEY,
+			requests INTEGER NOT NULL,
+			hits INTEGER NOT NULL,
+			misses INTEGER NOT NULL,
+			passes INTEGER NOT NULL,
+			verifications INTEGER NOT NULL,
+			verify_failures INTEGER NOT NULL,
+			bytes_down INTEGER NOT NULL,
+			bytes_up INTEGER NOT NULL,
+			bytes_saved INTEGER NOT NULL,
+			store_bytes INTEGER NOT NULL,
+			store_modules INTEGER NOT NULL,
+			store_versions INTEGER NOT NULL,
+			store_files INTEGER NOT NULL
+		)`,
+	} {
+		if _, err := legacy.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := legacy.Exec(`INSERT INTO buckets (bucket, requests, hits, misses,
+			passes, verifications, verify_failures, bytes_down, bytes_up,
+			bytes_saved, store_bytes, store_modules, store_versions, store_files)
+			VALUES (?, 3, 2, 1, 0, 0, 0, 30, 10, 20, 4096, 1, 1, 1)`,
+		time.Now().UTC().Truncate(time.Minute).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	got, err := db.LoadTotals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Requests != 7 || got.Hits != 5 || got.BytesSaved != 900 {
+		t.Errorf("legacy totals = %+v, want the pre-upgrade counters", got)
+	}
+	if got.NeighbourHits != 0 || got.NeighbourMisses != 0 || got.BytesNeighbour != 0 {
+		t.Errorf("legacy totals neighbour = %+v, want zeros", got)
+	}
+
+	// The new columns accept writes after the in-place migration.
+	want := got
+	want.NeighbourHits, want.NeighbourMisses, want.BytesNeighbour = 4, 2, 600
+	if err := db.SaveTotals(want); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = db.LoadTotals(); err != nil {
+		t.Fatal(err)
+	} else if got != want {
+		t.Errorf("totals after upgrade = %+v, want %+v", got, want)
+	}
+
+	now := time.Now().UTC()
+	pts, err := db.Series(now.Add(-time.Hour), now.Add(time.Hour), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pts) != 1 || pts[0].Requests != 3 || pts[0].BytesNeighbour != 0 {
+		t.Errorf("series after upgrade = %+v", pts)
+	}
 }

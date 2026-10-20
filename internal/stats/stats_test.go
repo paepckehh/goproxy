@@ -70,6 +70,41 @@ func TestStats_CountersAndEvents(t *testing.T) {
 	}
 }
 
+func TestStats_NeighbourHitAndMiss(t *testing.T) {
+	t.Parallel()
+	s := fastCollector(nil)
+	stop := run(t, s)
+	defer stop()
+
+	s.NeighbourHit("example.com/m", "v1.0.0", "zip", 500, 500, 50*time.Millisecond, true, "goproxy2:9090")
+	s.NeighbourMiss()
+
+	waitFor(t, func() bool {
+		l := s.Snapshot().Lifetime
+		return l.NeighbourHits == 1 && l.NeighbourMisses == 1
+	})
+	want := Totals{Requests: 1, Misses: 1, BytesDown: 500, BytesNeighbour: 500,
+		Verifications: 1, NeighbourHits: 1, NeighbourMisses: 1}
+	if got := s.Snapshot().Lifetime; got != want {
+		t.Errorf("lifetime = %+v, want %+v", got, want)
+	}
+	if got := s.Snapshot().Session; got != want {
+		t.Errorf("session = %+v, want %+v", got, want)
+	}
+
+	waitFor(t, func() bool { return len(s.Snapshot().Events) >= 1 })
+	ev := s.Snapshot().Events[0]
+	if ev.Result != "neighbour" {
+		t.Errorf("event result = %q, want neighbour", ev.Result)
+	}
+	if !strings.Contains(ev.Detail, "goproxy2:9090") || !strings.Contains(ev.Detail, "verified") {
+		t.Errorf("event detail = %q, want source and verification", ev.Detail)
+	}
+	if ev.Bytes != 500 {
+		t.Errorf("event bytes = %d, want 500", ev.Bytes)
+	}
+}
+
 func TestStats_TrafficBuckets(t *testing.T) {
 	t.Parallel()
 	s := fastCollector(nil)

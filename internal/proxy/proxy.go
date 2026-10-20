@@ -7,9 +7,11 @@
 //	GET /<module>/@v/<version>.zip         cached, hash-verified
 //	GET /sumdb/<database>/...              transparently forwarded
 //
-// Cache misses are deduplicated with singleflight, downloaded to a temp
-// file, verified against the signed checksum database record, then
-// committed to the cache with an atomic rename.
+// Cache misses are deduplicated with singleflight, fetched from a
+// neighbouring cache when one is configured (they are queried in parallel
+// before the upstream), downloaded to a temp file, verified against the
+// signed checksum database record, then committed to the cache with an
+// atomic rename.
 package proxy
 
 import (
@@ -39,6 +41,11 @@ import (
 const (
 	negTTL       = time.Minute
 	smallBodyMax = 4 << 20 // .info and .mod bodies must stay small
+
+	// neighbourHeaderTimeout bounds how long a neighbour cache may take to
+	// answer before the upstream fallback proceeds. It covers the response
+	// header only, so large zip bodies stream without a deadline.
+	neighbourHeaderTimeout = 5 * time.Second
 )
 
 // statusError passes an upstream status code through to the client.
@@ -61,6 +68,7 @@ type fetchResult struct {
 	verified   bool
 	unverified bool
 	fromCache  bool
+	neighbour  string // neighbour cache that served it; empty for upstream
 }
 
 // Proxy serves the module protocol against a cache and an upstream.
@@ -73,6 +81,11 @@ type Proxy struct {
 	client   *http.Client
 	log      *slog.Logger
 
+	// neighbours are other goproxy instances asked, in parallel, before
+	// the upstream on a cache miss.
+	neighbours      []*url.URL
+	neighbourClient *http.Client
+
 	inflight singleflight.Group
 
 	negMu sync.Mutex
@@ -82,10 +95,18 @@ type Proxy struct {
 }
 
 // New creates the proxy. upstream is e.g. https://proxy.golang.org.
-func New(st *store.Store, db *sumdb.DB, m *stats.Stats, upstream string, verify bool, client *http.Client, log *slog.Logger) (*Proxy, error) {
+// neighbours are base URLs of other goproxy instances (e.g.
+// http://goproxy1:9090) asked in parallel before the upstream on a cache
+// miss; invalid entries reject the configuration instead of silently
+// disabling the feature.
+func New(st *store.Store, db *sumdb.DB, m *stats.Stats, upstream string, neighbours []string, verify bool, client *http.Client, log *slog.Logger) (*Proxy, error) {
 	u, err := url.Parse(upstream)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("proxy: invalid upstream url %q", upstream)
+	}
+	nbs, err := parseNeighbours(neighbours)
+	if err != nil {
+		return nil, err
 	}
 	if client == nil {
 		client = &http.Client{}
@@ -115,15 +136,17 @@ func New(st *store.Store, db *sumdb.DB, m *stats.Stats, upstream string, verify 
 		},
 	}
 	return &Proxy{
-		store:      st,
-		sumdb:      db,
-		stats:      m,
-		upstream:   u,
-		verify:     verify,
-		client:     client,
-		log:        log,
-		neg:        make(map[string]negEntry),
-		sumdbProxy: rp,
+		store:           st,
+		sumdb:           db,
+		stats:           m,
+		upstream:        u,
+		verify:          verify,
+		client:          client,
+		log:             log,
+		neighbours:      nbs,
+		neighbourClient: neighbourClient(client),
+		neg:             make(map[string]negEntry),
+		sumdbProxy:      rp,
 	}, nil
 }
 
@@ -247,6 +270,10 @@ func (p *Proxy) serveVersioned(w http.ResponseWriter, r *http.Request, mod, ver 
 		return
 	}
 	served := p.serveFile(w, r, res.file, mod, ver, kind, start, false)
+	if res.neighbour != "" {
+		p.stats.NeighbourHit(mod, ver, string(kind), res.bytesUp, served, time.Since(start), res.verified, res.neighbour)
+		return
+	}
 	p.stats.Miss(mod, ver, string(kind), res.bytesUp, served, time.Since(start), res.verified)
 }
 
@@ -303,26 +330,37 @@ func (p *Proxy) fetch(ctx context.Context, mod, ver string, kind store.Kind) (*f
 	if err != nil {
 		return nil, &statusError{code: http.StatusBadRequest, body: err.Error()}
 	}
-	u := p.upstream.JoinPath(esc, "@v", escv+"."+string(kind))
+	segments := []string{esc, "@v", escv + "." + string(kind)}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("proxy: %w", err)
-	}
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("proxy: fetch %s@%s: %w", mod, ver, err)
+	// Neighbour caches first: a warm neighbour saves the slow, metered
+	// upstream fetch. They are all asked in parallel; the first copy wins
+	// and cancels the rest. Only a full neighbour miss reaches upstream.
+	resp, neighbour := p.fromNeighbours(ctx, segments)
+	if resp == nil {
+		if len(p.neighbours) > 0 {
+			p.stats.NeighbourMiss()
+		}
+		u := p.upstream.JoinPath(segments...)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("proxy: %w", err)
+		}
+		resp, err = p.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("proxy: fetch %s@%s: %w", mod, ver, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+				p.setNegative(mod, ver, kind, resp.StatusCode)
+			}
+			return nil, &statusError{
+				code: resp.StatusCode,
+				body: fmt.Sprintf("upstream %s: %s", u.Host, statusSummary(resp.Body)),
+			}
+		}
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
-			p.setNegative(mod, ver, kind, resp.StatusCode)
-		}
-		return nil, &statusError{
-			code: resp.StatusCode,
-			body: fmt.Sprintf("upstream %s: %s", u.Host, statusSummary(resp.Body)),
-		}
-	}
 
 	// The signed checksum record for this version, when one exists.
 	var rec *sumdb.Record
@@ -338,14 +376,145 @@ func (p *Proxy) fetch(ctx context.Context, mod, ver string, kind store.Kind) (*f
 		}
 	}
 
+	var res *fetchResult
 	switch kind {
 	case store.KindZip:
-		return p.fetchZip(resp.Body, mod, ver, rec)
+		res, err = p.fetchZip(resp.Body, mod, ver, rec)
 	case store.KindMod:
-		return p.fetchMod(resp.Body, mod, ver, rec)
+		res, err = p.fetchMod(resp.Body, mod, ver, rec)
 	default:
-		return p.fetchInfo(resp.Body, mod, ver)
+		res, err = p.fetchInfo(resp.Body, mod, ver)
 	}
+	if res != nil {
+		res.neighbour = neighbour
+	}
+	return res, err
+}
+
+// parseNeighbours validates the neighbour cache base URLs.
+func parseNeighbours(raw []string) ([]*url.URL, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make([]*url.URL, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, s := range raw {
+		u, err := url.Parse(s)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, fmt.Errorf("proxy: invalid neighbour url %q", s)
+		}
+		key := strings.TrimRight(u.String(), "/")
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, u)
+	}
+	return out, nil
+}
+
+// neighbourClient derives a client for neighbour lookups from the module
+// client: same pool and dial timeouts, but a short response-header
+// timeout, so one unresponsive neighbour cannot stall the upstream
+// fallback. Bodies stream without a deadline (a zip may be large).
+func neighbourClient(base *http.Client) *http.Client {
+	c := *base
+	var tr *http.Transport
+	switch t := base.Transport.(type) {
+	case *http.Transport:
+		tr = t
+	case nil:
+		tr = http.DefaultTransport.(*http.Transport)
+	default:
+		return &c // custom round tripper: reuse as-is
+	}
+	clone := tr.Clone()
+	if clone.ResponseHeaderTimeout == 0 || clone.ResponseHeaderTimeout > neighbourHeaderTimeout {
+		clone.ResponseHeaderTimeout = neighbourHeaderTimeout
+	}
+	c.Transport = clone
+	return &c
+}
+
+// fromNeighbours asks every configured neighbour cache for the file in
+// parallel and returns the first successful response. A nil response means
+// no neighbour has it (or none is configured); the caller then falls back
+// to the configured upstream. The returned body owns the lookup group:
+// closing it aborts the still-pending neighbours, and their late replies
+// are drained and closed.
+func (p *Proxy) fromNeighbours(ctx context.Context, segments []string) (*http.Response, string) {
+	if len(p.neighbours) == 0 {
+		return nil, ""
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	type reply struct {
+		resp *http.Response
+		from string
+	}
+	replies := make(chan reply, len(p.neighbours))
+	for _, nb := range p.neighbours {
+		u := nb.JoinPath(segments...)
+		go func(u *url.URL) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+			if err != nil {
+				p.log.Debug("proxy: neighbour request", "url", u.Redacted(), "err", err)
+				replies <- reply{}
+				return
+			}
+			resp, err := p.neighbourClient.Do(req)
+			if err != nil {
+				p.log.Debug("proxy: neighbour unreachable",
+					"neighbour", u.Host, "path", u.Path, "err", err)
+				replies <- reply{}
+				return
+			}
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				p.log.Debug("proxy: neighbour has no copy",
+					"neighbour", u.Host, "path", u.Path, "status", resp.StatusCode)
+				replies <- reply{}
+				return
+			}
+			replies <- reply{resp: resp, from: u.Host}
+		}(u)
+	}
+	// A winning body cancels the group on Close, so the lookups that lose
+	// the race can still deliver a reply: drain and close them.
+	drain := func(n int) {
+		if n == 0 {
+			return
+		}
+		go func() {
+			for range n {
+				if r := <-replies; r.resp != nil {
+					r.resp.Body.Close()
+				}
+			}
+		}()
+	}
+	for i := range p.neighbours {
+		r := <-replies
+		if r.resp != nil {
+			r.resp.Body = &cancelBody{ReadCloser: r.resp.Body, cancel: cancel}
+			drain(len(p.neighbours) - i - 1)
+			return r.resp, r.from
+		}
+	}
+	cancel()
+	return nil, ""
+}
+
+// cancelBody cancels the neighbour lookup group once the winning response
+// body is closed, aborting the requests that lost the race.
+type cancelBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 func (p *Proxy) fetchZip(body io.Reader, mod, ver string, rec *sumdb.Record) (*fetchResult, error) {

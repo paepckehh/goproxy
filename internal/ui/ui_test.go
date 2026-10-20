@@ -58,6 +58,7 @@ func TestUI_IndexServesDashboard(t *testing.T) {
 func TestUI_DashboardAPI(t *testing.T) {
 	t.Parallel()
 	h := newTestUI(t)
+	h.stats.NeighbourHit("example.com/m", "v1.0.0", "zip", 2048, 2048, time.Millisecond, true, "peer:9090")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/dashboard", nil)
 	rec := httptest.NewRecorder()
@@ -68,11 +69,15 @@ func TestUI_DashboardAPI(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
 		t.Errorf("content type = %q", ct)
 	}
+
 	var payload struct {
 		Version string `json:"version"`
 		Stats   struct {
 			Lifetime struct {
-				Requests int64 `json:"requests"`
+				Requests       int64 `json:"requests"`
+				NeighbourHits  int64 `json:"neighbourHits"`
+				NeighbourMiss  int64 `json:"neighbourMisses"`
+				BytesNeighbour int64 `json:"bytesNeighbour"`
 			} `json:"lifetime"`
 		} `json:"stats"`
 		Store struct {
@@ -95,6 +100,9 @@ func TestUI_DashboardAPI(t *testing.T) {
 	}
 	if !payload.Modules[0].Verified {
 		t.Error("module not reported as verified")
+	}
+	if payload.Stats.Lifetime.NeighbourHits != 1 || payload.Stats.Lifetime.BytesNeighbour != 2048 {
+		t.Errorf("neighbour stats = %+v, want 1 hit / 2048 bytes", payload.Stats.Lifetime)
 	}
 }
 
@@ -151,6 +159,51 @@ func TestUI_HistoryAPI(t *testing.T) {
 	}
 }
 
+func TestUI_HistoryAPIIncludesNeighbourCounters(t *testing.T) {
+	t.Parallel()
+	h := newTestUI(t)
+
+	now := time.Now().UTC()
+	if err := h.hist.RecordBucket(stats.Bucket{
+		Bucket: now.Truncate(time.Minute),
+		Totals: stats.Totals{Requests: 2, Misses: 1, NeighbourHits: 1,
+			NeighbourMisses: 1, BytesNeighbour: 512},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/history?range=24h", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var payload struct {
+		Points []struct {
+			NeighbourHits   int64 `json:"neighbourHits"`
+			NeighbourMisses int64 `json:"neighbourMisses"`
+			BytesNeighbour  int64 `json:"bytesNeighbour"`
+		} `json:"points"`
+		Summary struct {
+			NeighbourHits   int64 `json:"neighbourHits"`
+			NeighbourMisses int64 `json:"neighbourMisses"`
+			BytesNeighbour  int64 `json:"bytesNeighbour"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Points) != 1 {
+		t.Fatalf("points = %d, want 1", len(payload.Points))
+	}
+	if p := payload.Points[0]; p.NeighbourHits != 1 || p.NeighbourMisses != 1 || p.BytesNeighbour != 512 {
+		t.Errorf("point = %+v", p)
+	}
+	if s := payload.Summary; s.NeighbourHits != 1 || s.NeighbourMisses != 1 || s.BytesNeighbour != 512 {
+		t.Errorf("summary = %+v", s)
+	}
+}
+
 func TestUI_HistoryAPIAllRange(t *testing.T) {
 	t.Parallel()
 	h := newTestUI(t)
@@ -202,6 +255,9 @@ func TestUI_StaticAssets(t *testing.T) {
 		}
 		if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, want) {
 			t.Errorf("%s content type = %q, want %q", path, ct, want)
+		}
+		if path == "/static/app.js" && !strings.Contains(rec.Body.String(), "neighbourHits") {
+			t.Error("dashboard script does not render the neighbour cache stats")
 		}
 	}
 }

@@ -34,6 +34,30 @@ func TestResolveRoot(t *testing.T) {
 	}
 }
 
+func TestEnvList(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		val  string
+		want []string
+	}{
+		{name: "empty"},
+		{name: "comma separated", val: "http://a:9090,http://b:9090",
+			want: []string{"http://a:9090", "http://b:9090"}},
+		{name: "whitespace separated", val: "http://a:9090\nhttp://b:9090 ",
+			want: []string{"http://a:9090", "http://b:9090"}},
+		{name: "mixed separators", val: " http://a:9090 , http://b:9090,",
+			want: []string{"http://a:9090", "http://b:9090"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NEIGHBOUR_CACHES", tc.val)
+			got := envList("NEIGHBOUR_CACHES")
+			if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+				t.Fatalf("envList = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestResolveStatsDB(t *testing.T) {
 	stateDir := t.TempDir()
 	fileAsStateDir := filepath.Join(t.TempDir(), "notadir")
