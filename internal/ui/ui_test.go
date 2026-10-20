@@ -262,6 +262,19 @@ func TestUI_StaticAssets(t *testing.T) {
 		if path == "/static/app.js" && !strings.Contains(rec.Body.String(), "neighbourHits") {
 			t.Error("dashboard script does not render the neighbour cache stats")
 		}
+		if path == "/static/app.js" {
+			js := rec.Body.String()
+			// The dashboard is push-only: no data endpoint, no polling
+			// loop, no client-side refresh timer.
+			for _, forbidden := range []string{"fetch(", "setInterval(", "setTimeout(", "/api/dashboard", "/api/history"} {
+				if strings.Contains(js, forbidden) {
+					t.Errorf("dashboard script contains %q; every update must arrive over SSE", forbidden)
+				}
+			}
+			if !strings.Contains(js, `addEventListener("tick"`) {
+				t.Error("dashboard script does not age timestamps on the server tick")
+			}
+		}
 	}
 }
 

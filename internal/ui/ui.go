@@ -41,8 +41,8 @@ var historyRanges = map[string]historyRange{
 	"all": {span: 0, res: 24 * time.Hour}, // from the first recorded bucket
 }
 
-// dashboardPayload is the one-shot dashboard state, served by
-// /api/dashboard and pushed in full when a dashboard first connects.
+// dashboardPayload is the one-shot dashboard state for scripts and
+// health probes; the dashboard page itself only consumes the SSE stream.
 type dashboardPayload struct {
 	Version string          `json:"version"`
 	Stats   stats.Snapshot  `json:"stats"`
@@ -117,8 +117,8 @@ func (h *Handler) state() dashboardPayload {
 	}
 }
 
-// dashboard serves the full state as JSON. The live dashboard uses the
-// SSE stream instead; this endpoint stays for scripts and as a fallback.
+// dashboard serves the full state as JSON for scripts and probes. The
+// dashboard page never calls it: every value it shows arrives over SSE.
 func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -201,8 +201,8 @@ func (h *Handler) storeState() ([]byte, error) {
 // events streams the whole dashboard as Server-Sent Events: the recent
 // event ring once on connect, one message per new event, the live
 // counters and cache table every stateInterval (only when they changed),
-// and the long-term series every historyInterval for ?range=. Comment
-// lines keep idle connections open.
+// the long-term series every historyInterval for ?range=, and a tick that
+// ages timestamps while keeping idle connections open.
 func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 	fl, ok := w.(http.Flusher)
 	if !ok {
@@ -270,7 +270,9 @@ func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-keepalive.C:
-			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+			// A tick keeps idle connections open and lets the page age its
+			// timestamps without a client-side timer or another request.
+			if writeSSE(w, "tick", []byte("{}")) != nil {
 				return
 			}
 			fl.Flush()

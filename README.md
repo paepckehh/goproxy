@@ -117,9 +117,9 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 | `GET /<module>/@v/<v>.mod` | cached, hash-verified against the checksum database |
 | `GET /<module>/@v/<v>.zip` | cached, hash-verified against the checksum database; on a miss the neighbour caches are asked in parallel first |
 | `GET /sumdb/<db>/...` | forwarded verbatim to the configured database only (404 otherwise), with the `/supported` probe answered locally, so go clients run their full verification through the proxy |
-| `GET /` | operations dashboard (all updates pushed over SSE; polling only as a no-EventSource fallback) |
-| `GET /api/dashboard` | JSON snapshot: stats, store, modules, events |
-| `GET /api/events?range=24h` | Server-Sent Events stream: `events` seed, `store` cache table (only when changed), `stats` counters every 2s, `history` for the selected range every 30s, and one `event` message per new proxy event |
+| `GET /` | operations dashboard (push-only: every update arrives over SSE; no fetching, polling or client-side timers) |
+| `GET /api/dashboard` | JSON snapshot for scripts and probes (the dashboard page does not use it) |
+| `GET /api/events?range=24h` | Server-Sent Events stream: `events` seed, `store` cache table (only when changed), `stats` counters every 2s, `history` for the selected range every 30s, a `tick` every 25s that ages timestamps, and one `event` message per new proxy event |
 | `GET /api/history?range=24h` | long-term stats series (`24h`, `7d`, `30d`, `1y`, `all`) |
 | `GET /healthz` | liveness plus version |
 

@@ -35,8 +35,8 @@ internal/history      long-term stats in SQLite (pure-Go driver, WAL, minute buc
 internal/proxy       GOPROXY protocol handlers (singleflight, neighbour-first
                      fetch, verify, cache; fetches detached from client contexts)
 internal/ui          embedded dashboard (static/, vanilla JS, no external assets);
-                     all updates pushed over SSE (/api/events), no polling
-                     while the stream is open
+                     push-only: every update arrives over SSE (/api/events),
+                     no fetches, no polling, no client-side refresh timers
 internal/systemd     LISTEN_FDS socket-activation listener intake (zero deps)
 internal/version     version injected via -ldflags
 .github/workflows    golang.yml (build/vet/test CI), release.yml (GoReleaser)
@@ -61,11 +61,15 @@ dashboard is driven
 entirely by one Server-Sent Events stream (`/api/events?range=`): it seeds
 the event ring, counters, cache table and the selected history series on
 connect, then pushes each new event, the counters every 2s, the cache table
-only when it changed (no idle table reloads), and the history series every
-30s. A non-blocking fan-out keeps a slow client from stalling the collector;
-the page appends event rows instead of rebuilding the list. Without
-EventSource the page falls back to polling `/api/dashboard` every 10s. The
-request hot path never
+only when it changed (no idle table reloads), the history series every
+30s, and a `tick` every 25s. A non-blocking fan-out keeps a slow client
+from stalling the collector. The page is push-only: it never fetches
+dashboard data, never polls and runs no refresh timer, so an idle tab costs
+one open stream. Browsers without EventSource get no dashboard updates. The
+page appends event rows instead of rebuilding the list, and reconciles the
+cache table in place (rows keep their DOM nodes, only cells change and the
+row fade animation is gone), so pushed updates never flicker or reload it.
+The request hot path never
 touches the DB: atomics + buffered channel, batched flush every 30s plus a
 final flush+WAL checkpoint on shutdown; recorder errors surface as warning
 pills in the dashboard header (`persistErrors`, dropped events) and never

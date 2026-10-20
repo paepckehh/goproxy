@@ -396,7 +396,6 @@ th {
 }
 td { border-bottom: 1px solid rgba(148, 163, 255, 0.07); }
 td.r, th.r { text-align: right; }
-tbody tr { animation: fadeIn 0.4s ease both; }
 tbody tr { transition: background 0.2s ease; }
 tbody tr:hover { background: rgba(129, 140, 248, 0.08); }
 td .path { font-family: ui-monospace, monospace; font-size: 12px; }

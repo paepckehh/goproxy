@@ -123,28 +123,70 @@ function shortMod(path) {
   return parts.length > 2 ? parts.slice(-2).join("/") : path;
 }
 
-// The module table is rebuilt only when the pushed cache state changed,
-// so an idle dashboard never reloads rows under the cursor.
-function renderModules(mods) {
-  const body = $("modules-body");
-  $("modules-empty").style.display = mods.length ? "none" : "block";
-  $("modules-hint").textContent = mods.length ? "top " + Math.min(mods.length, 10) + " by bytes served" : "";
-  const rows = mods.slice(0, 10).map((m) => {
-    const used = m.lastUsed && !m.lastUsed.startsWith("0001") ? ago(m.lastUsed) : "never";
-    const trust = m.verified
+// One module row, built once. Updates patch the cells in place so a
+// pushed cache change never reloads or re-flashes the table.
+function moduleRow(m) {
+  const tr = document.createElement("tr");
+  tr.dataset.path = m.path;
+  tr.innerHTML = `<td><span class="path"></span></td>
+    <td class="r"></td>
+    <td class="r"></td>
+    <td class="r"></td>
+    <td class="r"></td>
+    <td class="dim" data-time=""></td>
+    <td></td>`;
+  updateModuleRow(tr, m);
+  return tr;
+}
+
+function updateModuleRow(tr, m) {
+  const cells = tr.children;
+  cells[0].firstChild.textContent = m.path;
+  cells[1].textContent = m.versions;
+  cells[2].textContent = fmtBytes(m.sizeBytes);
+  cells[3].textContent = fmtNum(m.requests);
+  cells[4].textContent = fmtBytes(m.servedBytes);
+  const used = m.lastUsed && !m.lastUsed.startsWith("0001") ? m.lastUsed : "";
+  cells[5].dataset.time = used;
+  cells[5].textContent = used ? ago(used) : "never";
+  const chip = cells[6].firstChild;
+  if (chip) {
+    chip.textContent = m.verified ? "verified" : "unverified";
+    chip.className = "chip " + (m.verified ? "ok" : "warn");
+  } else {
+    cells[6].innerHTML = m.verified
       ? '<span class="chip ok">verified</span>'
       : '<span class="chip warn">unverified</span>';
-    return `<tr>
-      <td><span class="path">${escapeHTML(m.path)}</span></td>
-      <td class="r">${m.versions}</td>
-      <td class="r">${fmtBytes(m.sizeBytes)}</td>
-      <td class="r">${fmtNum(m.requests)}</td>
-      <td class="r">${fmtBytes(m.servedBytes)}</td>
-      <td class="dim">${used}</td>
-      <td>${trust}</td>
-    </tr>`;
+  }
+}
+
+// Reconcile the table against the pushed cache state: existing rows keep
+// their nodes and only their cells change, so nothing fades or reloads.
+function renderModules(mods) {
+  const body = $("modules-body");
+  const top = mods.slice(0, 10);
+  $("modules-empty").style.display = top.length ? "none" : "block";
+  $("modules-hint").textContent = top.length ? "top " + top.length + " by bytes served" : "";
+
+  const rows = new Map();
+  for (const tr of Array.from(body.children)) rows.set(tr.dataset.path, tr);
+
+  const keep = new Set();
+  top.forEach((m, i) => {
+    keep.add(m.path);
+    let tr = rows.get(m.path);
+    if (tr) {
+      updateModuleRow(tr, m);
+    } else {
+      tr = moduleRow(m);
+      rows.set(m.path, tr);
+    }
+    const at = body.children[i];
+    if (at !== tr) body.insertBefore(tr, at || null);
   });
-  body.innerHTML = rows.join("");
+  for (const [path, tr] of rows) {
+    if (!keep.has(path)) tr.remove();
+  }
 }
 
 function eventChip(result) {
@@ -596,26 +638,6 @@ function renderHistorySummary(s) {
   $("history-summary").innerHTML = chips.join("");
 }
 
-// historySeq guards against stale responses: the fallback fetch and
-// range-click fetches can resolve out of order, and only the newest
-// request may render.
-let historySeq = 0;
-
-async function fetchHistory() {
-  const seq = ++historySeq;
-  try {
-    const resp = await fetch("/api/history?range=" + encodeURIComponent(state.historyRange), {
-      cache: "no-store",
-    });
-    if (!resp.ok) throw new Error("status " + resp.status);
-    const data = await resp.json();
-    if (seq !== historySeq) return; // superseded by a newer request
-    applyHistory(data);
-  } catch (err) {
-    // keep the last rendered chart; the next push or poll retries
-  }
-}
-
 function applyStats(s) {
   if (!s) return;
   state.stats = s;
@@ -643,55 +665,15 @@ function applyHistory(data) {
   renderHistorySummary(data.summary || {});
 }
 
-// Fallback path for browsers without EventSource support.
-function applyDashboard(data) {
-  if (!data) return;
-  if (data.version) state.version = data.version;
-  applyStore(data);
-  applyStats(data.stats);
-}
-
-function setConn(ok) {
+function setConn(ok, text) {
   const pill = document.querySelector(".pill.live");
   const label = $("conn");
-  if (ok) {
-    pill.classList.remove("bad");
-    label.textContent = "live";
-  } else {
-    pill.classList.add("bad");
-    label.textContent = "reconnecting";
-  }
+  pill.classList.toggle("bad", !ok);
+  label.textContent = ok ? "live" : (text || "reconnecting");
 }
 
 // ---- Live dashboard: one SSE stream carries every update ----
-let sseLive = false;
 let sse = null;
-let pollTimer = null;
-
-async function poll() {
-  try {
-    const resp = await fetch("/api/dashboard", { cache: "no-store" });
-    if (!resp.ok) throw new Error("status " + resp.status);
-    applyDashboard(await resp.json());
-    setConn(true);
-  } catch (err) {
-    setConn(false);
-  }
-}
-
-// Polling is only the fallback while no live stream is open.
-function startFallback() {
-  if (pollTimer) return;
-  poll();
-  pollTimer = setInterval(poll, 10000);
-}
-
-function stopFallback() {
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  }
-}
 
 function parseSSE(msg) {
   try {
@@ -701,12 +683,20 @@ function parseSSE(msg) {
   }
 }
 
-// connectEvents opens the live stream for the current history range. The
-// server seeds events, cache state, counters and history, then pushes
-// every change; no dashboard data is polled while it is open.
+// Relative timestamps age only when the server pushes; the stream's tick
+// keeps them fresh without a client-side timer or another request.
+function refreshAges() {
+  document.querySelectorAll("#events [data-time], #modules-body [data-time]").forEach((el) => {
+    el.textContent = el.dataset.time ? ago(el.dataset.time) : "never";
+  });
+}
+
+// connectEvents opens the one stream the dashboard needs. The server seeds
+// events, cache state, counters and history on connect and then pushes
+// every change; the page never fetches dashboard data on its own.
 function connectEvents() {
   if (!("EventSource" in window)) {
-    startFallback();
+    setConn(false, "no SSE support");
     return;
   }
   if (sse) {
@@ -726,45 +716,28 @@ function connectEvents() {
   source.addEventListener("event", (msg) => {
     const ev = parseSSE(msg);
     if (!ev) return;
-    sseLive = true;
     appendEvent(ev);
     setConn(true);
   });
-  source.onopen = () => {
-    sseLive = true;
-    setConn(true);
-    stopFallback();
-  };
+  source.addEventListener("tick", refreshAges);
+  source.onopen = () => setConn(true);
   source.onerror = () => {
-    // EventSource reconnects on its own; polling takes over meanwhile.
-    sseLive = false;
+    // EventSource reconnects on its own; the pill shows the gap.
     setConn(false);
-    startFallback();
   };
 }
-
-// Relative timestamps age without rebuilding the list.
-setInterval(() => {
-  document.querySelectorAll("#events .ev-time[data-time]").forEach((el) => {
-    el.textContent = ago(el.dataset.time);
-  });
-}, 30000);
 
 document.querySelectorAll("#ranges button").forEach((btn) => {
   btn.addEventListener("click", () => {
     document.querySelectorAll("#ranges button").forEach((b) => b.classList.remove("active"));
     btn.classList.add("active");
     state.historyRange = btn.dataset.range;
-    // A new stream carries the newly selected range; without SSE fall
-    // back to a direct fetch.
+    // A fresh stream seeds the newly selected range.
     connectEvents();
-    if (!("EventSource" in window)) fetchHistory();
   });
 });
 
 chart3d.init();
-// One immediate fetch paints the dashboard before the stream is open;
-// the stream then owns every update. fetchHistory is the no-SSE path.
-fetchHistory();
-if (!("EventSource" in window)) startFallback();
+// Every value on the page arrives over the stream: no initial fetch, no
+// polling, no timer-driven updates.
 connectEvents();
