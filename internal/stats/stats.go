@@ -477,13 +477,14 @@ func (s *Stats) Indexed(modules int) {
 // Prewarm records the upstream bandwidth an hourly cache sync spent and
 // publishes one summary event. A sync is not a client request, so the
 // request, hit and miss counters stay untouched.
-func (s *Stats) Prewarm(modules, fetched int, bytes int64) {
+func (s *Stats) Prewarm(modules, fetched, failed int, bytes int64) {
 	s.bytesUp.Add(bytes)
-	s.send(Event{
-		Time: time.Now().UTC(), Result: "prewarm",
-		Detail: fmt.Sprintf("fleet sync: %d hottest modules, %d files fetched, %d bytes upstream",
-			modules, fetched, bytes),
-	})
+	detail := fmt.Sprintf("fleet sync: %d hottest modules, %d fetched, %d bytes pulled",
+		modules, fetched, bytes)
+	if failed > 0 {
+		detail += fmt.Sprintf(", %d failed", failed)
+	}
+	s.send(Event{Time: time.Now().UTC(), Result: "prewarm", Detail: detail})
 }
 
 func verifiedText(v bool) string {

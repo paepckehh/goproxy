@@ -103,7 +103,10 @@ func main() {
 	// The neighbour fleet is probed at startup and then every 10 minutes,
 	// so the dashboard shows which peers are currently reachable.
 	peers := fleet.New(neighbours, moduleClient(), log)
-	uiH := ui.New(m, st, hist, ver, peers)
+	// The warmer pre-caches the hottest modules; the dashboard shows the
+	// details of the most recent pass.
+	warmer := proxy.NewWarmer(p, st.Popular, log)
+	uiH := ui.New(m, st, hist, ver, peers, warmer)
 
 	// Socket activation: serve on the sockets systemd passed (LISTEN_FDS)
 	// when present; otherwise bind the resolved address. EXIT_ON_IDLE is
@@ -154,7 +157,7 @@ func main() {
 			return
 		case <-indexed:
 		}
-		proxy.NewWarmer(p, st.Popular, log).Run(ctx)
+		warmer.Run(ctx)
 	}()
 
 	go func() {

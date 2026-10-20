@@ -1,6 +1,15 @@
 "use strict";
 
-const state = { version: "", stats: null, store: null, modules: [], neighbours: [], historyRange: "24h" };
+const state = {
+  version: "",
+  stats: null,
+  store: null,
+  modules: [],
+  popular: [],
+  neighbours: [],
+  prewarm: null,
+  historyRange: "24h",
+};
 const counters = new Map(); // element id -> last numeric value
 
 const $ = (id) => document.getElementById(id);
@@ -663,8 +672,106 @@ function applyStore(payload) {
     renderModules(payload.modules);
     chart3d.setData(payload.modules);
   }
+  renderPopular(payload.popular);
   renderNeighbours(payload.neighbours);
   if (state.stats) renderKPIs(state.stats, state.store);
+}
+
+// Most requested modules: the 25 hottest by requests served, reconciled in
+// place like the archived-modules table.
+function renderPopular(list) {
+  state.popular = Array.isArray(list) ? list : [];
+  const body = $("popular-body");
+  if (!body) return;
+  $("popular-hint").textContent = state.popular.length
+    ? "top " + state.popular.length + " by requests served"
+    : "";
+  const rows = new Map();
+  for (const tr of body.children) rows.set(tr.dataset.path, tr);
+  const seen = new Set();
+  for (const m of state.popular) {
+    seen.add(m.path);
+    let tr = rows.get(m.path);
+    if (!tr) {
+      tr = document.createElement("tr");
+      tr.dataset.path = m.path;
+      tr.innerHTML = `<td><span class="path"></span></td><td class="r"></td>
+        <td class="r"></td><td class="r"></td><td class="dim" data-time=""></td>`;
+      body.appendChild(tr);
+    }
+    const cells = tr.children;
+    cells[0].firstChild.textContent = m.path;
+    cells[1].textContent = fmtNum(m.requests);
+    cells[2].textContent = fmtBytes(m.servedBytes);
+    cells[3].textContent = fmtBytes(m.sizeBytes);
+    cells[4].dataset.time = m.lastUsed && !m.lastUsed.startsWith("0001") ? m.lastUsed : "";
+  }
+  for (const [path, tr] of rows) {
+    if (!seen.has(path)) tr.remove();
+  }
+  $("popular-empty").style.display = state.popular.length ? "none" : "";
+  refreshAges();
+}
+
+// Pre-cache sync: the last hourly pass with its summary and per-module
+// result. The report only arrives when it changed, so a rebuild is cheap.
+function applyPrewarm(report) {
+  if (!report) return;
+  state.prewarm = report;
+  renderPrewarm(report);
+}
+
+function renderPrewarm(r) {
+  const ran = r.startedAt && !r.startedAt.startsWith("0001");
+  const items = Array.isArray(r.items) ? r.items : [];
+  $("prewarm-empty").style.display = ran ? "none" : "";
+  const chips = [];
+  if (ran) {
+    chips.push(`<span class="hstat">last run <b data-time="${r.startedAt}"></b></span>`);
+    chips.push(`<span class="hstat"><b>${(r.durationMs / 1000).toFixed(1)}s</b> took</span>`);
+    chips.push(`<span class="hstat"><b>${fmtNum(r.modules)}</b> modules</span>`);
+    chips.push(`<span class="hstat green"><b>${fmtNum(r.fetched)}</b> fetched</span>`);
+    chips.push(`<span class="hstat"><b>${fmtBytes(r.bytes)}</b> pulled</span>`);
+    if (r.failed > 0) {
+      chips.push(`<span class="hstat red"><b>${fmtNum(r.failed)}</b> failed</span>`);
+    }
+    if (r.nextRun && !r.nextRun.startsWith("0001")) {
+      chips.push(`<span class="hstat">next <b>${new Date(r.nextRun).toLocaleTimeString()}</b></span>`);
+    }
+  }
+  $("prewarm-summary").innerHTML = chips.join("");
+  $("prewarm-items").replaceChildren(...items.map(prewarmItem));
+  refreshAges();
+}
+
+function prewarmItem(it) {
+  const li = document.createElement("li");
+  const mod = document.createElement("span");
+  mod.className = "pw-mod path";
+  mod.textContent = it.module;
+  const ver = document.createElement("span");
+  ver.className = "pw-ver dim";
+  ver.textContent = it.version || "—";
+  const bytes = document.createElement("span");
+  bytes.className = "pw-bytes";
+  bytes.textContent = it.bytes > 0 ? fmtBytes(it.bytes) : "already cached";
+  const src = document.createElement("span");
+  src.className = "pw-src dim";
+  src.textContent = it.source ? "peer " + it.source : it.bytes > 0 ? "upstream" : "";
+  const chip = document.createElement("span");
+  if (it.error) {
+    chip.className = "chip bad";
+    chip.textContent = "failed";
+    chip.title = it.error;
+  } else if (it.bytes > 0) {
+    chip.className = "chip ok";
+    chip.textContent = "fetched";
+  } else {
+    chip.className = "chip nb";
+    chip.textContent = "warm";
+  }
+  li.append(mod, ver, bytes, src, chip);
+  return li;
 }
 
 // Neighbour caches: one row per configured peer, reconciled in place so a
@@ -743,7 +850,7 @@ function parseSSE(msg) {
 // Relative timestamps age only when the server pushes; the stream's tick
 // keeps them fresh without a client-side timer or another request.
 function refreshAges() {
-  document.querySelectorAll("#events [data-time], #modules-body [data-time], #fleet-body [data-time]").forEach((el) => {
+  document.querySelectorAll("#events [data-time], #modules-body [data-time], #popular-body [data-time], #fleet-body [data-time], #prewarm-summary [data-time]").forEach((el) => {
     el.textContent = el.dataset.time ? ago(el.dataset.time) : "never";
   });
 }
@@ -769,6 +876,7 @@ function connectEvents() {
   });
   source.addEventListener("stats", (msg) => applyStats(parseSSE(msg)));
   source.addEventListener("store", (msg) => applyStore(parseSSE(msg)));
+  source.addEventListener("prewarm", (msg) => applyPrewarm(parseSSE(msg)));
   source.addEventListener("history", (msg) => applyHistory(parseSSE(msg)));
   source.addEventListener("event", (msg) => {
     const ev = parseSSE(msg);

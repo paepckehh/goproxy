@@ -338,36 +338,35 @@ func (s *Store) Modules() []ModStat {
 	return out
 }
 
-// Popular returns up to limit cached module paths ordered by request count.
-// It is the ranking the hourly cache sync uses to keep the hottest modules
-// of the fleet warm; ties fall back to the path for a stable order.
-func (s *Store) Popular(limit int) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	type entry struct {
-		path     string
-		requests int64
-	}
-	entries := make([]entry, 0, len(s.mods))
-	for _, m := range s.mods {
-		var n int64
-		if u := s.usage[m.Path]; u != nil {
-			n = u.requests.Load()
-		}
-		entries = append(entries, entry{path: m.Path, requests: n})
-	}
-	slices.SortFunc(entries, func(a, b entry) int {
-		if c := cmp.Compare(b.requests, a.requests); c != 0 {
+// TopRequests returns up to limit module aggregates ordered by served
+// requests, the ranking behind the dashboard's most-requested table and the
+// hourly cache sync. Ties fall back to bytes served, then to the path, for a
+// stable order. A negative limit returns every module.
+func (s *Store) TopRequests(limit int) []ModStat {
+	mods := s.Modules()
+	slices.SortStableFunc(mods, func(a, b ModStat) int {
+		if c := cmp.Compare(b.Requests, a.Requests); c != 0 {
 			return c
 		}
-		return cmp.Compare(a.path, b.path)
+		if c := cmp.Compare(b.Served, a.Served); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Path, b.Path)
 	})
-	if len(entries) > limit {
-		entries = entries[:limit]
+	if limit >= 0 && len(mods) > limit {
+		mods = mods[:limit]
 	}
-	out := make([]string, len(entries))
-	for i, e := range entries {
-		out[i] = e.path
+	return mods
+}
+
+// Popular returns up to limit cached module paths ordered by request count,
+// the ranking the hourly cache sync uses to keep the hottest modules of the
+// fleet warm.
+func (s *Store) Popular(limit int) []string {
+	top := s.TopRequests(limit)
+	out := make([]string, len(top))
+	for i, m := range top {
+		out[i] = m.Path
 	}
 	return out
 }

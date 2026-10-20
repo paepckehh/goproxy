@@ -365,6 +365,46 @@ header {
 .fleet { margin-bottom: 18px; }
 .fleet[hidden] { display: none; }
 
+.popular { margin-bottom: 18px; }
+.prewarm { margin-bottom: 18px; }
+.prewarm-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.prewarm-items li {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) auto auto auto auto;
+  gap: 12px;
+  align-items: center;
+  padding: 6px 4px;
+  border-bottom: 1px solid rgba(148, 163, 255, 0.07);
+  font-size: 12.5px;
+}
+.prewarm-items .pw-mod {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.prewarm-items .pw-ver,
+.prewarm-items .pw-bytes,
+.prewarm-items .pw-src {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+@media (max-width: 720px) {
+  .prewarm-items li { grid-template-columns: minmax(0, 1fr) auto auto; }
+  .prewarm-items .pw-ver, .prewarm-items .pw-src { display: none; }
+}
+.hstat.red b { color: var(--red); }
+
+.traffic { margin-bottom: 22px; }
+
 .bottom {
   display: grid;
   grid-template-columns: 1.7fr 1fr;

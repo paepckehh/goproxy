@@ -25,6 +25,9 @@ const (
 	stateInterval     = 2 * time.Second  // live dashboard push cadence
 	historyInterval   = 30 * time.Second // long-term series refresh
 	keepaliveInterval = 25 * time.Second
+
+	// popularLimit is how many modules the most-requested table shows.
+	popularLimit = 25
 )
 
 // historyRange is one selectable dashboard history window. Aggregates
@@ -45,11 +48,13 @@ var historyRanges = map[string]historyRange{
 // dashboardPayload is the one-shot dashboard state for scripts and
 // health probes; the dashboard page itself only consumes the SSE stream.
 type dashboardPayload struct {
-	Version    string          `json:"version"`
-	Stats      stats.Snapshot  `json:"stats"`
-	Store      store.Summary   `json:"store"`
-	Modules    []store.ModStat `json:"modules"`
-	Neighbours []fleet.Status  `json:"neighbours"`
+	Version    string           `json:"version"`
+	Stats      stats.Snapshot   `json:"stats"`
+	Store      store.Summary    `json:"store"`
+	Modules    []store.ModStat  `json:"modules"`
+	Popular    []store.ModStat  `json:"popular"`
+	Neighbours []fleet.Status   `json:"neighbours"`
+	Prewarm    fleet.WarmReport `json:"prewarm"`
 }
 
 // statePayload is the cache half of a live dashboard push: the store
@@ -59,6 +64,7 @@ type statePayload struct {
 	Version    string          `json:"version"`
 	Store      store.Summary   `json:"store"`
 	Modules    []store.ModStat `json:"modules"`
+	Popular    []store.ModStat `json:"popular"`
 	Neighbours []fleet.Status  `json:"neighbours"`
 }
 
@@ -66,6 +72,12 @@ type statePayload struct {
 // source (standalone proxy) reports none.
 type PeerSource interface {
 	Statuses() []fleet.Status
+}
+
+// PrewarmSource reports the most recent fleet cache sync. A nil source
+// reports that no sync has run.
+type PrewarmSource interface {
+	Report() fleet.WarmReport
 }
 
 // historyPayload is one aggregated long-term series.
@@ -86,12 +98,14 @@ type Handler struct {
 	hist    *history.DB
 	version string
 	peers   PeerSource
+	prewarm PrewarmSource
 }
 
 // New creates the dashboard handler. peers reports the neighbour cache
-// health shown on the dashboard; nil means this proxy is standalone.
-func New(m *stats.Stats, s *store.Store, h *history.DB, version string, peers PeerSource) *Handler {
-	return &Handler{stats: m, store: s, hist: h, version: version, peers: peers}
+// health and prewarm the last fleet cache sync; nil means this proxy is
+// standalone or no sync has run yet.
+func New(m *stats.Stats, s *store.Store, h *history.DB, version string, peers PeerSource, prewarm PrewarmSource) *Handler {
+	return &Handler{stats: m, store: s, hist: h, version: version, peers: peers, prewarm: prewarm}
 }
 
 // neighbours returns the current fleet status, if any.
@@ -100,6 +114,14 @@ func (h *Handler) neighbours() []fleet.Status {
 		return nil
 	}
 	return h.peers.Statuses()
+}
+
+// prewarmReport returns the most recent fleet cache sync, if any.
+func (h *Handler) prewarmReport() fleet.WarmReport {
+	if h.prewarm == nil {
+		return fleet.WarmReport{}
+	}
+	return h.prewarm.Report()
 }
 
 // ServeHTTP routes /, /static/*, /api/dashboard, /api/history and
@@ -134,7 +156,9 @@ func (h *Handler) state() dashboardPayload {
 		Stats:      h.stats.Snapshot(),
 		Store:      h.store.Summary(),
 		Modules:    h.store.Modules(),
+		Popular:    h.store.TopRequests(popularLimit),
 		Neighbours: h.neighbours(),
+		Prewarm:    h.prewarmReport(),
 	}
 }
 
@@ -210,14 +234,20 @@ func (h *Handler) statsState() ([]byte, error) {
 	return json.Marshal(snap)
 }
 
-// storeState renders the cache summary and module table.
+// storeState renders the cache summary, module tables and fleet status.
 func (h *Handler) storeState() ([]byte, error) {
 	return json.Marshal(statePayload{
 		Version:    h.version,
 		Store:      h.store.Summary(),
 		Modules:    h.store.Modules(),
+		Popular:    h.store.TopRequests(popularLimit),
 		Neighbours: h.neighbours(),
 	})
+}
+
+// prewarmState renders the last fleet cache sync.
+func (h *Handler) prewarmState() ([]byte, error) {
+	return json.Marshal(h.prewarmReport())
 }
 
 // events streams the whole dashboard as Server-Sent Events: the recent
@@ -261,6 +291,10 @@ func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 	}
 	lastStore, err := h.storeState()
 	if err != nil || writeSSE(w, "store", lastStore) != nil {
+		return
+	}
+	lastPrewarm, err := h.prewarmState()
+	if err != nil || writeSSE(w, "prewarm", lastPrewarm) != nil {
 		return
 	}
 	lastStats, err := h.statsState()
@@ -310,6 +344,13 @@ func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 			if data, err := h.storeState(); err == nil && !bytes.Equal(data, lastStore) {
 				lastStore = data
 				if writeSSE(w, "store", data) != nil {
+					return
+				}
+				sent = true
+			}
+			if data, err := h.prewarmState(); err == nil && !bytes.Equal(data, lastPrewarm) {
+				lastPrewarm = data
+				if writeSSE(w, "prewarm", data) != nil {
 					return
 				}
 				sent = true

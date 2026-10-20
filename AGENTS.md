@@ -13,10 +13,10 @@ policy churn.
   NEIGHBOUR_CACHES (parallel peer lookup before the upstream)
 - secure: validates upstream signatures
 - cool: modern 3D animated business-like dashboard about packages, sources,
-  cache hits/misses, neighbour-cache hits and peer bandwidth, live
-  neighbour-cache health (online state, version, latency), upstream and
-  downstream bandwidth used and saved, store size, plus long-term (24h to
-  all-time) history charts
+  cache hits/misses, the 25 most requested modules, neighbour-cache hits and
+  peer bandwidth, live neighbour-cache health (online state, version,
+  latency), pre-cache sync details, upstream and downstream bandwidth used
+  and saved, store size, plus long-term (24h to all-time) history charts
 - persistent: long-term stats in the SQLite stats database via the pure-Go
   cgo-free driver `modernc.org/sqlite`; lifetime counters, per-module
   served-bandwidth totals, minute-resolution
@@ -63,10 +63,14 @@ flushed every 30s so the cache table and top-modules bandwidth chart keep
 their totals across restarts) and the event log (pruned after 90d). The
 dashboard is driven
 entirely by one Server-Sent Events stream (`/api/events?range=`): it seeds
-the event ring, counters, cache table and the selected history series on
-connect, then pushes each new event, the counters every 2s, the cache table
-only when it changed (no idle table reloads), the history series every
-30s, and a `tick` every 25s. A non-blocking fan-out keeps a slow client
+the event ring, counters, cache table, most-requested list, pre-cache report
+and the selected history series on connect, then pushes each new event, the
+counters every 2s, the cache table and most-requested list only when they
+changed (no idle table reloads), the pre-cache report only when a pass
+finished, the history series every 30s, and a `tick` every 25s. Sections run
+top to bottom: KPIs, 3D top-modules chart, 25 most requested modules,
+neighbour caches, pre-cache sync, long-term history, archived modules plus
+events, and the traffic chart last. A non-blocking fan-out keeps a slow client
 from stalling the collector. The page is push-only: it never fetches
 dashboard data, never polls and runs no refresh timer, so an idle tab costs
 one open stream. Browsers without EventSource get no dashboard updates. The
@@ -117,8 +121,11 @@ ranking) and then once per hour with ±10 minutes jitter, the proxy resolves
 the latest version of the 100 most requested modules and fetches their
 `.info`, `.mod` and `.zip` through the normal fetch path
 (`internal/proxy/warm.go`). Neighbour caches are therefore asked first and
-one upstream copy serves the fleet. The pass logs one Info line and
-publishes one `prewarm` event; it is not a client request, so
+one upstream copy serves the fleet. The pass logs one Info line, publishes
+one `prewarm` event and keeps a `fleet.WarmReport` (`Warmer.Report`:
+started, duration, next run, modules/fetched/failed/bytes and one
+`WarmItem` per module with resolved version, bytes, peer source and error)
+that the dashboard's pre-cache card renders. It is not a client request, so
 request/hit/miss counters stay untouched while its bandwidth still counts
 as upstream or peer bytes (`Stats.Prewarm`). The startup pass waits for the
 index scan so it does not run against an empty ranking.

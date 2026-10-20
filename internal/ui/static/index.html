@@ -80,17 +80,22 @@
         <ul class="chart-agenda" id="chart3d-agenda" aria-label="top modules"></ul>
       </div>
     </div>
-    <div class="card chart">
+  </section>
+
+  <section class="popular">
+    <div class="card table-card">
       <div class="card-head">
-        <h2>Traffic</h2>
-        <span class="hint">hits · misses · last 2 min</span>
+        <h2>Most requested modules</h2>
+        <span class="hint" id="popular-hint"></span>
       </div>
-      <canvas id="chart-traffic"></canvas>
-      <div class="legend">
-        <span><i class="dot cyan"></i>hits</span>
-        <span><i class="dot amber"></i>misses</span>
-        <span><i class="dot violet"></i>bytes/s</span>
-      </div>
+      <table>
+        <thead><tr>
+          <th>module</th><th class="r">requests</th><th class="r">served</th>
+          <th class="r">size</th><th>last used</th>
+        </tr></thead>
+        <tbody id="popular-body"></tbody>
+      </table>
+      <div class="empty" id="popular-empty">no requests yet — run a build through the proxy</div>
     </div>
   </section>
 
@@ -106,6 +111,18 @@
         </tr></thead>
         <tbody id="fleet-body"></tbody>
       </table>
+    </div>
+  </section>
+
+  <section class="prewarm">
+    <div class="card">
+      <div class="card-head">
+        <h2>Pre-cache sync</h2>
+        <span class="hint" id="prewarm-hint">hottest 100 modules · startup, then hourly ±10 min</span>
+      </div>
+      <div class="history-summary" id="prewarm-summary"></div>
+      <ul class="prewarm-items" id="prewarm-items"></ul>
+      <div class="empty" id="prewarm-empty">no sync yet — the first pass runs after the startup index scan</div>
     </div>
   </section>
 
@@ -154,6 +171,20 @@
       </div>
       <ul id="events"></ul>
       <div class="empty" id="events-empty">no events yet</div>
+    </div>
+  </section>
+  <section class="traffic">
+    <div class="card chart">
+      <div class="card-head">
+        <h2>Traffic</h2>
+        <span class="hint">hits · misses · last 2 min</span>
+      </div>
+      <canvas id="chart-traffic"></canvas>
+      <div class="legend">
+        <span><i class="dot cyan"></i>hits</span>
+        <span><i class="dot amber"></i>misses</span>
+        <span><i class="dot violet"></i>bytes/s</span>
+      </div>
     </div>
   </section>
 </main>

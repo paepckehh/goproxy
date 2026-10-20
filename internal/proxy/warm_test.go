@@ -60,9 +60,25 @@ func TestWarmer_SyncCachesLatestOfPopularModules(t *testing.T) {
 		}
 	}
 
+	// The report carries the per-module success details the dashboard shows.
+	report := w.Report()
+	if report.StartedAt.IsZero() || report.DurationMS < 0 {
+		t.Errorf("report timing = %+v, want a recorded pass", report)
+	}
+	if len(report.Items) != 1 {
+		t.Fatalf("report items = %+v, want one module", report.Items)
+	}
+	item := report.Items[0]
+	if item.Module != testMod || item.Version != testVer || item.Bytes <= 0 || item.Err != "" {
+		t.Errorf("report item = %+v, want a successful prewarm of %s@%s", item, testMod, testVer)
+	}
+
 	// A second pass finds everything cached and pulls nothing.
 	if sum := w.Sync(context.Background()); sum.Fetched != 0 || sum.Bytes != 0 || sum.Failed != 0 {
 		t.Errorf("second summary = %+v, want a no-op pass", sum)
+	}
+	if got := w.Report().Items; len(got) != 1 || got[0].Bytes != 0 {
+		t.Errorf("second report items = %+v, want the module reported as already cached", got)
 	}
 }
 
@@ -70,8 +86,12 @@ func TestWarmer_SyncWithoutPopularModules(t *testing.T) {
 	t.Parallel()
 	env := newTestEnv(t, nil)
 	w := NewWarmer(env.proxy, env.store.Popular, slog.New(slog.DiscardHandler))
-	if sum := w.Sync(context.Background()); sum != (WarmSummary{}) {
+	sum := w.Sync(context.Background())
+	if sum.Modules != 0 || sum.Fetched != 0 || sum.Bytes != 0 || sum.Failed != 0 || len(sum.Items) != 0 {
 		t.Errorf("summary = %+v, want an empty pass", sum)
+	}
+	if got := w.Report(); got.StartedAt.IsZero() || len(got.Items) != 0 {
+		t.Errorf("report = %+v, want a recorded empty pass", got)
 	}
 }
 

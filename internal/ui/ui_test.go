@@ -36,12 +36,16 @@ func newTestUIWithPeers(t *testing.T, peers PeerSource) *Handler {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { hist.Close() })
-	return New(stats.New(nil), st, hist, "v0.0.0-test", peers)
+	return New(stats.New(nil), st, hist, "v0.0.0-test", peers, nil)
 }
 
 type fakePeers []fleet.Status
 
 func (f fakePeers) Statuses() []fleet.Status { return f }
+
+type fakePrewarm fleet.WarmReport
+
+func (f fakePrewarm) Report() fleet.WarmReport { return fleet.WarmReport(f) }
 
 func TestUI_IndexServesDashboard(t *testing.T) {
 	t.Parallel()
@@ -323,10 +327,10 @@ func TestUI_EventsSSEStreamsNewEvents(t *testing.T) {
 		<-runDone
 	}()
 
-	reader := openSSE(t, New(m, st, hist, "v0.0.0-test", nil), "")
+	reader := openSSE(t, New(m, st, hist, "v0.0.0-test", nil, nil), "")
 
 	// A fresh stream seeds the whole dashboard before live traffic.
-	for _, want := range []string{"events", "store", "stats", "history"} {
+	for _, want := range []string{"events", "store", "prewarm", "stats", "history"} {
 		if name, _ := readSSE(t, reader); name != want {
 			t.Fatalf("seed message = %q, want %q", name, want)
 		}
@@ -505,5 +509,84 @@ func TestUI_ReportsNeighbourHealth(t *testing.T) {
 	}
 	if len(pushed.Neighbours) != 2 {
 		t.Errorf("pushed neighbours = %+v, want 2 peers", pushed.Neighbours)
+	}
+}
+
+func TestUI_ReportsPopularModulesAndPrewarm(t *testing.T) {
+	t.Parallel()
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mod := range []string{"example.com/cold", "example.com/hot"} {
+		if _, err := st.PutBytes(mod, "v1.0.0", store.KindMod, []byte("module "+mod+"\n"), "", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 7 {
+		st.Get("example.com/hot", "v1.0.0", store.KindMod).RecordHit(1)
+	}
+	st.Get("example.com/cold", "v1.0.0", store.KindMod).RecordHit(1)
+
+	hist, err := history.Open(filepath.Join(t.TempDir(), "stats.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { hist.Close() })
+
+	started := time.Now().UTC().Truncate(time.Second)
+	report := fleet.WarmReport{
+		StartedAt: started, DurationMS: 1200, NextRun: started.Add(time.Hour),
+		Modules: 2, Fetched: 1, Bytes: 4096,
+		Items: []fleet.WarmItem{{Module: "example.com/hot", Version: "v1.0.0", Bytes: 4096}},
+	}
+	h := New(stats.New(nil), st, hist, "v-test", nil, fakePrewarm(report))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dashboard", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var dash struct {
+		Popular []store.ModStat  `json:"popular"`
+		Prewarm fleet.WarmReport `json:"prewarm"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &dash); err != nil {
+		t.Fatal(err)
+	}
+	if len(dash.Popular) != 2 || dash.Popular[0].Path != "example.com/hot" || dash.Popular[0].Requests != 7 {
+		t.Fatalf("popular = %+v, want the hot module first", dash.Popular)
+	}
+	if len(dash.Prewarm.Items) != 1 || dash.Prewarm.Items[0].Module != "example.com/hot" {
+		t.Errorf("prewarm = %+v, want the last sync details", dash.Prewarm)
+	}
+	if dash.Prewarm.Fetched != 1 || dash.Prewarm.Bytes != 4096 {
+		t.Errorf("prewarm summary = %+v, want 1 fetched / 4096 bytes", dash.Prewarm)
+	}
+
+	raw, err := h.storeState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pushed struct {
+		Popular []store.ModStat `json:"popular"`
+	}
+	if err := json.Unmarshal(raw, &pushed); err != nil {
+		t.Fatal(err)
+	}
+	if len(pushed.Popular) != 2 {
+		t.Errorf("pushed popular = %+v, want both modules", pushed.Popular)
+	}
+
+	raw, err = h.prewarmState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pushedReport fleet.WarmReport
+	if err := json.Unmarshal(raw, &pushedReport); err != nil {
+		t.Fatal(err)
+	}
+	if len(pushedReport.Items) != 1 {
+		t.Errorf("pushed prewarm = %+v, want the last sync details", pushedReport)
 	}
 }

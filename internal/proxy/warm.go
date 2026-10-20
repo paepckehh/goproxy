@@ -15,6 +15,7 @@ import (
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
 
+	"paepcke.de/goproxy/internal/fleet"
 	"paepcke.de/goproxy/internal/store"
 )
 
@@ -34,14 +35,6 @@ const (
 	prewarmTimeout = 10 * time.Minute
 )
 
-// WarmSummary is the outcome of one cache sync pass.
-type WarmSummary struct {
-	Modules int   // modules considered
-	Fetched int   // modules whose files were downloaded (not already cached)
-	Bytes   int64 // upstream or neighbour bytes pulled
-	Failed  int   // modules that could not be resolved or fetched
-}
-
 // Warmer keeps the hottest modules of a fleet warm. At startup and then
 // once per jittered hour it resolves the latest version of the most
 // requested modules and fetches their files through the regular fetch path,
@@ -53,6 +46,9 @@ type Warmer struct {
 	interval time.Duration
 	jitter   time.Duration
 	log      *slog.Logger
+
+	mu   sync.RWMutex
+	last fleet.WarmReport
 }
 
 // NewWarmer creates a warmer. popular supplies the hottest module paths in
@@ -70,6 +66,22 @@ func NewWarmer(p *Proxy, popular func(limit int) []string, log *slog.Logger) *Wa
 	}
 }
 
+// Report returns the most recent sync, or the zero report before the first
+// pass. The item slice is a copy.
+func (w *Warmer) Report() fleet.WarmReport {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	out := w.last
+	out.Items = append([]fleet.WarmItem(nil), w.last.Items...)
+	return out
+}
+
+func (w *Warmer) store(report fleet.WarmReport) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.last = report
+}
+
 // Run syncs immediately, then once per jittered interval until ctx is
 // cancelled.
 func (w *Warmer) Run(ctx context.Context) {
@@ -81,88 +93,117 @@ func (w *Warmer) Run(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		sum := w.Sync(ctx)
+		report := w.Sync(ctx)
 		if ctx.Err() != nil {
 			return
 		}
-		w.report(sum)
-		timer.Reset(w.next())
+		next := w.next()
+		report.NextRun = time.Now().UTC().Add(next)
+		w.store(report)
+		w.report(report)
+		timer.Reset(next)
 	}
 }
 
-// Sync runs one prewarm pass with bounded parallelism.
-func (w *Warmer) Sync(ctx context.Context) WarmSummary {
+// Sync runs one prewarm pass with bounded parallelism and records the
+// report for the dashboard.
+func (w *Warmer) Sync(ctx context.Context) fleet.WarmReport {
+	start := time.Now()
 	mods := w.popular(PrewarmLimit)
-	sum := WarmSummary{Modules: len(mods)}
+	report := fleet.WarmReport{StartedAt: start.UTC()}
 	if len(mods) == 0 {
-		return sum
+		report.DurationMS = time.Since(start).Milliseconds()
+		w.store(report)
+		return report
 	}
-	var fetched, failed, bytes atomic.Int64
-	work := make(chan string)
+
+	items := make([]fleet.WarmItem, len(mods))
+	type job struct {
+		idx int
+		mod string
+	}
+	work := make(chan job)
 	var wg sync.WaitGroup
 	for range prewarmWorkers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for mod := range work {
-				n, ok := w.warmModule(ctx, mod)
-				if !ok {
-					failed.Add(1)
-					continue
-				}
-				if n > 0 {
-					fetched.Add(1)
-					bytes.Add(n)
-				}
+			for j := range work {
+				items[j.idx] = w.warmModule(ctx, j.mod)
 			}
 		}()
 	}
+	attempted := 0
 feed:
-	for _, mod := range mods {
+	for i, mod := range mods {
 		select {
 		case <-ctx.Done():
 			break feed
-		case work <- mod:
+		case work <- job{idx: i, mod: mod}:
+			attempted++
 		}
 	}
 	close(work)
 	wg.Wait()
-	sum.Fetched = int(fetched.Load())
-	sum.Bytes = bytes.Load()
-	sum.Failed = int(failed.Load())
-	return sum
+
+	var fetched, failed atomic.Int64
+	var bytes atomic.Int64
+	for _, it := range items[:attempted] {
+		if it.Err != "" {
+			failed.Add(1)
+			continue
+		}
+		if it.Bytes > 0 {
+			fetched.Add(1)
+			bytes.Add(it.Bytes)
+		}
+	}
+	report.Modules = attempted
+	report.Fetched = int(fetched.Load())
+	report.Bytes = bytes.Load()
+	report.Failed = int(failed.Load())
+	report.Items = items[:attempted]
+	report.DurationMS = time.Since(start).Milliseconds()
+	w.store(report)
+	return report
 }
 
 // warmModule resolves the latest version of one module and caches its
-// files. It returns the bytes pulled and whether the module was handled
-// without error.
-func (w *Warmer) warmModule(ctx context.Context, mod string) (int64, bool) {
+// files. The returned item reports the bytes pulled, the peer that served
+// them and, on failure, what went wrong.
+func (w *Warmer) warmModule(ctx context.Context, mod string) fleet.WarmItem {
+	item := fleet.WarmItem{Module: mod}
 	ctx, cancel := context.WithTimeout(ctx, prewarmTimeout)
 	defer cancel()
 	ver, err := w.p.latestVersion(ctx, mod)
 	if err != nil {
 		w.log.Debug("prewarm: resolving latest", "module", mod, "err", err)
-		return 0, false
+		item.Err = err.Error()
+		return item
 	}
-	var bytes int64
+	item.Version = ver
 	for _, kind := range []store.Kind{store.KindInfo, store.KindMod, store.KindZip} {
-		n, err := w.p.warmFile(ctx, mod, ver, kind)
+		res, err := w.p.warmFile(ctx, mod, ver, kind)
 		if err != nil {
 			w.log.Debug("prewarm: fetching", "module", mod, "version", ver, "kind", kind, "err", err)
-			return bytes, false
+			item.Err = err.Error()
+			return item
 		}
-		bytes += n
+		item.Bytes += res.bytesUp
+		if res.neighbour != "" {
+			item.Source = res.neighbour
+		}
 	}
-	return bytes, true
+	return item
 }
 
-func (w *Warmer) report(sum WarmSummary) {
-	if sum.Modules == 0 {
+func (w *Warmer) report(r fleet.WarmReport) {
+	if r.Modules == 0 {
 		return
 	}
 	w.log.Info("prewarm: fleet cache sync",
-		"modules", sum.Modules, "fetched", sum.Fetched, "bytes", sum.Bytes, "failed", sum.Failed)
-	w.p.stats.Prewarm(sum.Modules, sum.Fetched, sum.Bytes)
+		"modules", r.Modules, "fetched", r.Fetched, "bytes", r.Bytes, "failed", r.Failed)
+	w.p.stats.Prewarm(r.Modules, r.Fetched, r.Failed, r.Bytes)
 }
 
 // next returns the next interval with symmetric jitter applied.
@@ -175,18 +216,18 @@ func (w *Warmer) next() time.Duration {
 
 // warmFile fetches one module file through the shared singleflight path, so
 // a prewarm and a client request for the same file never download it twice.
-func (p *Proxy) warmFile(ctx context.Context, mod, ver string, kind store.Kind) (int64, error) {
+func (p *Proxy) warmFile(ctx context.Context, mod, ver string, kind store.Kind) (*fetchResult, error) {
 	v, err, _ := p.inflight.Do(negKey(mod, ver, kind), func() (any, error) {
 		return p.fetch(ctx, mod, ver, kind)
 	})
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	res, ok := v.(*fetchResult)
 	if !ok || res == nil {
-		return 0, nil
+		return &fetchResult{}, nil
 	}
-	return res.bytesUp, nil
+	return res, nil
 }
 
 // latestVersion asks the upstream which canonical version a module's latest

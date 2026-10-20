@@ -46,7 +46,7 @@ Everything a fleet of build machines needs, in one dependency-free binary.
 | **Archival** | Long-term module storage, not a disposable cache: files never expire, are stored as received, and serve straight from disk without the cloud upstream. The standard `download/` tree is portable, backup-friendly and usable as a `file://` proxy source |
 | **Shared** | `NEIGHBOUR_CACHES` chains goproxy instances: a cache miss asks every peer in parallel (short header timeout), the first copy wins, the rest are cancelled, and only a full peer miss falls through to the upstream. Peers are probed at startup and every 10 minutes (status, version and latency on the dashboard), and the top 100 modules are re-warmed at startup and once per jittered hour |
 | **Secure** | Every `.zip` and `.mod` is hash-verified against the signed sum.golang.org checksum database: Ed25519 note signature, transparency-log tree consistency, and tile inclusion proofs. Tampered content is refused, never cached |
-| **Observable** | Embedded dashboard with zero external assets, pushed live over one SSE stream (counters, cache table, events, history): hit ratio, bandwidth saved, traffic, store usage, a 3D top-modules chart with a static side agenda linked by color (module names never rotate with the scene), live event feed, and 24h to all-time history charts |
+| **Observable** | Embedded dashboard with zero external assets, pushed live over one SSE stream (counters, cache table, events, history): hit ratio, bandwidth saved, store usage, the 25 most requested modules, neighbour-cache health, pre-cache sync details, a 3D top-modules chart with a static side agenda linked by color (module names never rotate with the scene), live event feed, traffic, and 24h to all-time history charts |
 | **Persistent** | Lifetime counters, per-module served bandwidth (requests, bytes, last use), minute-resolution buckets and the event log survive restarts and reboots in SQLite (pure-Go driver, WAL journaling) |
 | **Deployable** | Socket activation with idle exit, hardened systemd units, NixOS modules, static cgo-free binary |
 | **Honest failure** | Checksum-database outages fail closed (a missing tile is an outage, not an unknown module); recorder errors surface as warning pills on the dashboard (`persistErrors`, dropped events) and never degrade proxying |
@@ -123,8 +123,8 @@ The GOPROXY protocol, the checksum database proxy, and the dashboard:
 | `GET /<module>/@v/<v>.zip` | cached, hash-verified against the checksum database; on a miss the neighbour caches are asked in parallel first |
 | `GET /sumdb/<db>/...` | forwarded verbatim to the configured database only (404 otherwise), with the `/supported` probe answered locally, so go clients run their full verification through the proxy |
 | `GET /` | operations dashboard (push-only: every update arrives over SSE; no fetching, polling or client-side timers) |
-| `GET /api/dashboard` | JSON snapshot for scripts and probes (the dashboard page does not use it); includes the neighbour-cache fleet status |
-| `GET /api/events?range=24h` | Server-Sent Events stream: `events` seed, `store` cache table (only when changed), `stats` counters every 2s, `history` for the selected range every 30s, a `tick` every 25s that ages timestamps, and one `event` message per new proxy event |
+| `GET /api/dashboard` | JSON snapshot for scripts and probes (the dashboard page does not use it); includes the 25 most requested modules, the neighbour-cache fleet status and the last pre-cache sync |
+| `GET /api/events?range=24h` | Server-Sent Events stream: `events` seed, `store` cache table and most-requested list (only when changed), `prewarm` sync details (only when a pass finished), `stats` counters every 2s, `history` for the selected range every 30s, a `tick` every 25s that ages timestamps, and one `event` message per new proxy event |
 | `GET /api/history?range=24h` | long-term stats series (`24h`, `7d`, `30d`, `1y`, `all`) |
 | `GET /healthz` | liveness plus version |
 
@@ -188,7 +188,11 @@ The fleet also stays warm on its own. At startup and then once per hour
 the proxy resolves the latest version of the 100 most requested modules and
 fetches their `.info`, `.mod` and `.zip` through the regular path, so a
 neighbour that already has the content serves it and one upstream copy
-serves the whole fleet. The pass is logged and published as a `prewarm`
+serves the whole fleet. The dashboard's **Pre-cache sync** card shows the
+last pass in detail: when it ran, how long it took, how many modules were
+considered, fetched, failed and how many bytes were pulled, the next run,
+and one row per module with its resolved version, size, source (peer or
+upstream) and result. The pass is logged and published as a `prewarm`
 event; it is not a client request, so request/hit/miss counters stay clean
 while the bandwidth it spends is still counted as upstream or peer traffic.
 
