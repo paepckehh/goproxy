@@ -1,5 +1,11 @@
 <div align="center">
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/hero-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/hero-light.svg">
+  <img src="docs/hero-light.svg" alt="goproxy: fast, checksum-verified Go modules archived on your disk, illustrated as a live operations dashboard" width="100%">
+</picture>
+
 # goproxy
 
 **Your builds. Your cache. No cloud permission.**
